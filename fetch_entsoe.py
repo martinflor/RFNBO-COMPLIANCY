@@ -612,10 +612,10 @@ def fetch_all_generation_types(date: str, zone_name: str) -> pd.DataFrame:
     if not eic_code:
         raise ValueError(f"Unknown bidding zone: {backend_zone_name}")
 
-    # Common generation types to fetch
+    # Common generation types to fetch (including wind types B18 and B19)
     common_psr_types = [
         "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "B10",
-        "B11", "B12", "B13", "B14", "B15", "B16"
+        "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18", "B19", "B20"
     ]
     
     all_data = []
@@ -961,8 +961,11 @@ def fetch_load_forecast_day_ahead(date: str, zone_name: str) -> Optional[pd.Data
 
 def fetch_installed_capacity_per_type(date: str, zone_name: str, psr_type: Optional[str] = None) -> pd.DataFrame:
     """
-    Installed Capacity Per Production Type – `A71` with `A33` (14.1.B).
+    Installed Capacity Per Production Type – `A68` with `A33` (14.1.A).
     Returns installed generation capacity by production type.
+    
+    Note: Changed from A71 to A68 as A71 is for generation forecast, not installed capacity.
+    A68 is the correct document type for installed generation capacity per type.
     """
     target_date = datetime.strptime(date, "%Y-%m-%d")
     start_time = target_date.replace(hour=0, minute=0)
@@ -975,7 +978,7 @@ def fetch_installed_capacity_per_type(date: str, zone_name: str, psr_type: Optio
         raise ValueError(f"Unknown bidding zone: {backend_zone_name}")
 
     params = {
-        "documentType": "A71",  # Generation forecast
+        "documentType": "A68",  # Installed generation capacity per type (was A71)
         "processType": "A33",   # Year ahead
         "in_Domain": eic_code,
         "periodStart": start_time.strftime("%Y%m%d%H%M"),
@@ -996,6 +999,11 @@ def fetch_installed_capacity_per_type(date: str, zone_name: str, psr_type: Optio
         # Rename value column - this is installed capacity in MW
         df = df.rename(columns={"value": "installed_capacity_mw"})
         df["zone"] = backend_zone_name
+        
+        # For A68 documents, the PSR type might not be extracted from XML correctly
+        # Since we passed it as a parameter, explicitly set it
+        if psr_type:
+            df["psr_type"] = psr_type
         
         return df[["timestamp", "zone", "installed_capacity_mw", "psr_type"]]
     

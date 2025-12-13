@@ -67,6 +67,8 @@ PPA_TECHNOLOGY_PSR_TYPES = {
     'Wind Onshore': ['B19'],  # Wind Onshore
     'Wind Offshore': ['B18'],  # Wind Offshore
     'Wind': ['B18', 'B19'],  # Both wind types combined
+    'Solar + Wind Offshore': [('B16', 0.5), ('B18', 0.5)],  # Solar 50%, Wind Offshore 50%
+    'Solar + Wind Onshore': [('B16', 0.5), ('B19', 0.5)]  # Solar 50%, Wind Onshore 50%
 }
 
 
@@ -248,58 +250,142 @@ def calculate_ppa_production_from_generation_data(
     ppa_technology: str,
     ppa_capacity_mw: float,
     prices_df: pd.DataFrame,
-    installed_capacity_df: pd.DataFrame = None
+    installed_capacity_df: pd.DataFrame = None,
+    solar_fraction: float = None,
+    wind_fraction: float = None
 ) -> pd.DataFrame:
     """
     Calculate PPA production based on actual generation data from ENTSOE.
     
-    This uses real capacity factors from ENTSOE generation data for the selected
-    technology (solar or wind) and scales it to the PPA capacity.
+    Supports single and combined technologies (e.g., Solar + Wind Offshore).
+    For combined technologies, each component is scaled independently then summed.
     
-    **Methodology** (as per user specification):
-    1. Get actual installed capacity from ENTSOE (documentType A71)
-    2. Calculate actual capacity factor: CF[t] = generation[t] / installed_capacity
-    3. Scale to PPA: PPA_production[t] = generation[t] × (PPA_capacity / installed_capacity)
+    **Methodology**:
+    1. Get actual installed capacity from ENTSOE (documentType A68)
+    2. Scale to PPA: PPA_production[t] = generation[t] × (PPA_capacity / installed_capacity)
+    3. For combined: Scale each technology independently, then sum
     
     Args:
         generation_df: DataFrame with generation data from ENTSOE (in MW)
-        ppa_technology: Technology type ('Solar', 'Wind', 'Wind Onshore', 'Wind Offshore')
-        ppa_capacity_mw: PPA installed capacity in MW
+        ppa_technology: Technology type ('Solar', 'Wind Onshore', 'Wind Offshore', 
+                                         'Solar + Wind Offshore', 'Solar + Wind Onshore')
+        ppa_capacity_mw: Total PPA installed capacity in MW
         prices_df: DataFrame with prices (for timestamp alignment)
         installed_capacity_df: DataFrame with installed capacity from ENTSOE (optional)
+        solar_fraction: Fraction of PPA capacity for solar (for combined tech, default 0.5)
+        wind_fraction: Fraction of PPA capacity for wind (for combined tech, default 0.5)
     
     Returns:
         DataFrame with columns:
-        - timestamp/datetime: Time
+        - datetime: Time
         - ppa_production_mw: Actual PPA production in MW
-        - ppa_capacity_factor: Capacity factor (0-1)
+        - (for combined) solar_production_mw: Solar component
+        - (for combined) wind_production_mw: Wind component
     
     Example:
         >>> gen_df = fetch_all_generation_types("2023-06-15", "Belgium")
         >>> capacity_df = fetch_installed_capacity_all_types("2023-06-15", "Belgium")
         >>> prices_df = fetch_day_ahead_prices("2023-06-15", "Belgium")
+        >>> # Single technology
         >>> ppa_prod = calculate_ppa_production_from_generation_data(
         ...     gen_df, 'Solar', 10.0, prices_df, capacity_df
         ... )
+        >>> # Combined technology
+        >>> ppa_prod = calculate_ppa_production_from_generation_data(
+        ...     gen_df, 'Solar + Wind Offshore', 10.0, prices_df, capacity_df,
+        ...     solar_fraction=0.5, wind_fraction=0.5
+        ... )
     """
     if generation_df.empty:
-        # No generation data - return constant capacity factor (fallback)
+        # No generation data - return zeros
+        logger.warning("No generation data available, PPA production set to 0")
         result_df = prices_df[['datetime']].copy()
-        result_df['ppa_production_mw'] = ppa_capacity_mw * 0.20  # Default 20% CF
-        result_df['ppa_capacity_factor'] = 0.20
+        result_df['ppa_production_mw'] = 0
         return result_df
     
-    # Get PSR types for the selected technology
-    psr_types = PPA_TECHNOLOGY_PSR_TYPES.get(ppa_technology, ['B16'])  # Default to solar
+    # Check if this is a combined technology
+    is_combined = '+' in ppa_technology
     
+    if is_combined:
+        # Combined technology: process each component separately
+        # Default to 50/50 split if not specified
+        if solar_fraction is None:
+            solar_fraction = 0.5
+        if wind_fraction is None:
+            wind_fraction = 0.5
+        
+        # Parse technology components
+        tech_components = ppa_technology.split(' + ')
+        if len(tech_components) != 2:
+            logger.error(f"Invalid combined technology format: {ppa_technology}")
+            result_df = prices_df[['datetime']].copy()
+            result_df['ppa_production_mw'] = 0
+            return result_df
+        
+        # Process each technology component
+        combined_production = prices_df[['datetime']].copy()
+        combined_production['ppa_production_mw'] = 0
+        
+        tech_fractions = [solar_fraction, wind_fraction]
+        component_productions = {}
+        
+        for tech, fraction in zip(tech_components, tech_fractions):
+            tech = tech.strip()
+            tech_capacity = ppa_capacity_mw * fraction
+            
+            # Get PSR types for this component
+            psr_types_mapping = {
+                'Solar': ['B16'],
+                'Wind Onshore': ['B19'],
+                'Wind Offshore': ['B18']
+            }
+            psr_types = psr_types_mapping.get(tech, ['B16'])
+            
+            # Process this technology component
+            tech_production = _process_single_technology(
+                generation_df, psr_types, tech, tech_capacity,
+                installed_capacity_df, prices_df
+            )
+            
+            component_productions[tech.lower().replace(' ', '_')] = tech_production['ppa_production_mw']
+            combined_production['ppa_production_mw'] += tech_production['ppa_production_mw']
+        
+        # Add component columns for combined technologies
+        for comp_name, comp_prod in component_productions.items():
+            combined_production[f'{comp_name}_production_mw'] = comp_prod
+        
+        return combined_production
+    
+    else:
+        # Single technology
+        # Get PSR types for the selected technology
+        psr_types = PPA_TECHNOLOGY_PSR_TYPES.get(ppa_technology, ['B16'])
+        
+        return _process_single_technology(
+            generation_df, psr_types, ppa_technology, ppa_capacity_mw,
+            installed_capacity_df, prices_df
+        )
+
+
+def _process_single_technology(
+    generation_df: pd.DataFrame,
+    psr_types: list,
+    technology_name: str,
+    capacity_mw: float,
+    installed_capacity_df: pd.DataFrame,
+    prices_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Helper function to process a single technology and return scaled production.
+    """
     # Filter generation data for the selected technology
     tech_generation = generation_df[generation_df['psr_type'].isin(psr_types)].copy()
     
     if tech_generation.empty:
-        # Technology not available in this country - use fallback
+        # Technology not available in this country
+        logger.warning(f"No generation data for technology {technology_name}, PPA production set to 0")
         result_df = prices_df[['datetime']].copy()
-        result_df['ppa_production_mw'] = ppa_capacity_mw * 0.20
-        result_df['ppa_capacity_factor'] = 0.20
+        result_df['ppa_production_mw'] = 0
         return result_df
     
     # Group by timestamp to get total generation for the technology
@@ -313,27 +399,21 @@ def calculate_ppa_production_from_generation_data(
         tech_capacity = installed_capacity_df[installed_capacity_df['psr_type'].isin(psr_types)].copy()
         
         if not tech_capacity.empty:
-            # Get installed capacity (typically constant, take mean)
+            # Get installed capacity (typically constant, to be verified)
             total_installed_capacity_mw = tech_capacity['installed_capacity_mw'].mean()
             
             if total_installed_capacity_mw > 0:
-                # Calculate capacity factor: CF = generation / installed_capacity
-                tech_by_time['capacity_factor'] = tech_by_time['generation_mw'] / total_installed_capacity_mw
-                tech_by_time['capacity_factor'] = tech_by_time['capacity_factor'].clip(upper=1.0)
                 
                 # Scale to PPA capacity: PPA_production = generation × (PPA_capacity / installed_capacity)
-                scaling_factor = ppa_capacity_mw / total_installed_capacity_mw
+                scaling_factor = capacity_mw / total_installed_capacity_mw
                 tech_by_time['ppa_production_mw'] = tech_by_time['generation_mw'] * scaling_factor
-                
-                logger.info(f"Using actual installed capacity: {total_installed_capacity_mw:.2f} MW for {ppa_technology}")
-                logger.info(f"Scaling factor: {scaling_factor:.4f} (PPA: {ppa_capacity_mw} MW)")
             else:
                 # Installed capacity is zero - fallback
                 logger.warning("Installed capacity is zero, using fallback method")
                 installed_capacity_df = None  # Trigger fallback below
         else:
             # No capacity data for this technology
-            logger.warning(f"No installed capacity data for {ppa_technology}, using fallback method")
+            logger.warning(f"No installed capacity data for {technology_name}, using fallback method")
             installed_capacity_df = None  # Trigger fallback
     
     if installed_capacity_df is None or installed_capacity_df.empty:
@@ -342,36 +422,29 @@ def calculate_ppa_production_from_generation_data(
         
         if max_generation_mw == 0:
             # No meaningful generation data
+            logger.warning(f"No meaningful generation data for {technology_name}, setting PPA production to 0")
             result_df = prices_df[['datetime']].copy()
-            result_df['ppa_production_mw'] = ppa_capacity_mw * 0.20
-            result_df['ppa_capacity_factor'] = 0.20
+            result_df['ppa_production_mw'] = 0
             return result_df
         
-        # Calculate capacity factor: CF = generation / estimated_capacity
-        tech_by_time['capacity_factor'] = tech_by_time['generation_mw'] / max_generation_mw
-        tech_by_time['capacity_factor'] = tech_by_time['capacity_factor'].clip(upper=1.0)
+        # Scale to PPA capacity based on estimated max generation
+        scaling_factor = capacity_mw / max_generation_mw
+        tech_by_time['ppa_production_mw'] = tech_by_time['generation_mw'] * scaling_factor
         
-        # Scale to PPA capacity
-        tech_by_time['ppa_production_mw'] = tech_by_time['capacity_factor'] * ppa_capacity_mw
-        
-        logger.info(f"Using estimated capacity (99th percentile): {max_generation_mw:.2f} MW for {ppa_technology}")
+        logger.info(f"Using estimated capacity (99th percentile): {max_generation_mw:.2f} MW for {technology_name}")
     
     # Merge with prices_df to align timestamps
     result_df = prices_df[['datetime']].copy()
+    
     result_df = result_df.merge(
-        tech_by_time[['timestamp', 'ppa_production_mw', 'capacity_factor']],
+        tech_by_time[['timestamp', 'ppa_production_mw']],
         left_on='datetime',
         right_on='timestamp',
         how='left'
     )
     
-    # Fill any missing values with mean capacity factor
-    mean_cf = tech_by_time['capacity_factor'].mean()
-    result_df['capacity_factor'] = result_df['capacity_factor'].fillna(mean_cf)
-    result_df['ppa_production_mw'] = result_df['ppa_production_mw'].fillna(ppa_capacity_mw * mean_cf)
-    
-    # Keep only needed columns
-    result_df = result_df[['datetime', 'ppa_production_mw', 'capacity_factor']].copy()
+    result_df['ppa_production_mw'] = result_df['ppa_production_mw'].fillna(0)
+    result_df = result_df[['datetime', 'ppa_production_mw']].copy()
     
     return result_df
 
@@ -379,7 +452,6 @@ def calculate_ppa_production_from_generation_data(
 def calculate_rfnbo_compliance(
     electrolyser_mw: float,
     ppa_capacity_mw: float,
-    ppa_capacity_factor: float,
     prices_df: pd.DataFrame,
     renewable_share: Union[float, pd.DataFrame],
     zone_name: str,
@@ -387,7 +459,9 @@ def calculate_rfnbo_compliance(
     use_price_threshold: bool = True,
     ppa_technology: str = None,
     generation_df: pd.DataFrame = None,
-    installed_capacity_df: pd.DataFrame = None
+    installed_capacity_df: pd.DataFrame = None,
+    solar_fraction: float = None,
+    wind_fraction: float = None
 ) -> pd.DataFrame:
     """
     Calculate RFNBO compliance for electrolyser operation.
@@ -409,15 +483,14 @@ def calculate_rfnbo_compliance(
     Args:
         electrolyser_mw: Electrolyser capacity in MW
         ppa_capacity_mw: PPA renewable capacity in MW
-        ppa_capacity_factor: Average capacity factor of PPA (0-1) - used if generation_df not provided
         prices_df: DataFrame with day-ahead prices from ENTSOE
         renewable_share: Either float (annual) or DataFrame (hourly) with renewable share
         zone_name: Country/zone name for emission factor lookup
         temporal_correlation: 'hourly' or 'monthly'
         use_price_threshold: Whether to apply 20€/MWh price rule
-        ppa_technology: PPA technology type ('Solar', 'Wind', etc.) - if provided, uses real generation data
-        generation_df: DataFrame with generation data - if provided with ppa_technology, calculates actual PPA production
-        installed_capacity_df: DataFrame with installed capacity data - if provided, uses for accurate CF calculation
+        ppa_technology: PPA technology type ('Solar', 'Wind', etc.) - uses real generation data
+        generation_df: DataFrame with generation data - calculates actual PPA production
+        installed_capacity_df: DataFrame with installed capacity data - uses for accurate scaling
     
     Returns:
         DataFrame with hourly results including:
@@ -437,14 +510,17 @@ def calculate_rfnbo_compliance(
     Example:
         >>> prices_df = fetch_day_ahead_prices("2023-06-15", "Belgium")
         >>> gen_df = fetch_all_generation_types("2023-06-15", "Belgium")
+        >>> capacity_df = fetch_installed_capacity_all_types("2023-06-15", "Belgium")
         >>> renewable_share = calculate_renewable_share(gen_df, 'annual')
         >>> results = calculate_rfnbo_compliance(
         ...     electrolyser_mw=1.0,
         ...     ppa_capacity_mw=1.5,
-        ...     ppa_capacity_factor=0.35,
         ...     prices_df=prices_df,
         ...     renewable_share=renewable_share,
-        ...     zone_name='Belgium'
+        ...     zone_name='Belgium',
+        ...     ppa_technology='Solar',
+        ...     generation_df=gen_df,
+        ...     installed_capacity_df=capacity_df
         ... )
         >>> print(f"Average RFNBO fraction: {results['rfnbo_fraction'].mean() * 100:.1f}%")
     """
@@ -466,24 +542,25 @@ def calculate_rfnbo_compliance(
     timestep_hours = df['resolution_minutes'] / 60
     df['electrolyser_consumption_mwh'] = df['electrolyser_consumption_mw'] * timestep_hours
     
-    # Calculate PPA production
-    if ppa_technology is not None and generation_df is not None:
+    # Calculate PPA production from actual generation data
+    if ppa_technology is not None and generation_df is not None and not generation_df.empty:
         # Use actual generation data for the selected technology
         ppa_production_df = calculate_ppa_production_from_generation_data(
             generation_df=generation_df,
             ppa_technology=ppa_technology,
             ppa_capacity_mw=ppa_capacity_mw,
             prices_df=df,
-            installed_capacity_df=installed_capacity_df
+            installed_capacity_df=installed_capacity_df,
+            solar_fraction=solar_fraction,
+            wind_fraction=wind_fraction
         )
         df = df.merge(ppa_production_df, on='datetime', how='left')
-        # Fill any missing values with constant capacity factor as fallback
-        df['ppa_production_mw'] = df['ppa_production_mw'].fillna(ppa_capacity_mw * ppa_capacity_factor)
-        df['capacity_factor'] = df['capacity_factor'].fillna(ppa_capacity_factor)
+        # Fill any missing values with 0 (no PPA production)
+        df['ppa_production_mw'] = df['ppa_production_mw'].fillna(0)
     else:
-        # Use constant capacity factor (simplified approach)
-        df['ppa_production_mw'] = ppa_capacity_mw * ppa_capacity_factor
-        df['capacity_factor'] = ppa_capacity_factor
+        # No generation data available - set PPA production to 0
+        logger.warning("No generation data available for PPA production calculation, setting to 0")
+        df['ppa_production_mw'] = 0
     
     df['ppa_energy_mwh'] = df['ppa_production_mw'] * timestep_hours
     

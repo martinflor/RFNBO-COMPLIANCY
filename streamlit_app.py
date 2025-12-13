@@ -143,7 +143,8 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
         return
     
     # 0. PPA Capacity Factor and Production (if using real generation data)
-    if 'capacity_factor' in results_df.columns and results_df['capacity_factor'].std() > 0.01:
+    # COMMENTED OUT FOR NOW - capacity factor temporarily disabled
+    if False and 'capacity_factor' in results_df.columns and results_df['capacity_factor'].std() > 0.01:
         st.subheader("☀️ PPA Capacity Factor and Production Profile")
         st.caption("Actual capacity factor and adjusted PPA production from ENTSOE generation data")
         
@@ -787,6 +788,50 @@ def display_data_explorer_tab():
             fig3.update_layout(height=400, xaxis_tickangle=-45)
             st.plotly_chart(fig3, use_container_width=True)
             
+            # Installed Capacity by Source Type
+            installed_capacity_df = None
+            if 'fetched_data' in st.session_state:
+                if 'installed_capacity' in st.session_state['fetched_data']:
+                    installed_capacity_df = st.session_state['fetched_data']['installed_capacity']
+            
+            if installed_capacity_df is not None and not installed_capacity_df.empty:
+                # Filter out rows with None psr_type (shouldn't happen after our fix, but just in case)
+                capacity_df = installed_capacity_df[installed_capacity_df['psr_type'].notna()].copy()
+                
+                if not capacity_df.empty:
+                    st.subheader("🏭 Installed Capacity by Source Type")
+                    st.caption("Showing installed generation capacity (MW) per source type")
+                    
+                    # Add readable names and renewable flag
+                    capacity_df['source_type'] = capacity_df['psr_type'].map(PSR_TYPE_MAPPING)
+                    capacity_df['is_renewable'] = capacity_df['psr_type'].isin(RENEWABLE_PSR_TYPES)
+                    
+                    # Filter out rows where source_type mapping failed (None)
+                    capacity_df = capacity_df[capacity_df['source_type'].notna()]
+                    
+                    if not capacity_df.empty:
+                        # Group by source type and calculate average installed capacity
+                        capacity_summary = capacity_df.groupby(['source_type', 'is_renewable'])['installed_capacity_mw'].mean().reset_index()
+                        capacity_summary = capacity_summary.sort_values('installed_capacity_mw', ascending=False)
+                        
+                        fig_capacity = px.bar(
+                            capacity_summary,
+                            x='source_type',
+                            y='installed_capacity_mw',
+                            color='is_renewable',
+                            color_discrete_map={True: 'green', False: 'gray'},
+                            labels={'installed_capacity_mw': 'Installed Capacity (MW)', 'source_type': 'Source Type', 'is_renewable': 'Renewable'},
+                            title="Installed Capacity by Source Type"
+                        )
+                        fig_capacity.update_layout(height=400, xaxis_tickangle=-45)
+                        st.plotly_chart(fig_capacity, use_container_width=True)
+                    else:
+                        st.warning("⚠️ Installed capacity data found but no valid PSR types. Please check the data.")
+                else:
+                    st.info("ℹ️ Installed capacity data is empty or contains no valid PSR types.")
+            else:
+                st.info("ℹ️ No installed capacity data available. Please fetch data to see this plot.")
+            
             # Generation over time (aggregated)
             st.subheader("📈 Generation Power Over Time")
             st.caption("Showing instantaneous power (MW) over time")
@@ -802,6 +847,237 @@ def display_data_explorer_tab():
             )
             fig4.update_layout(height=400, hovermode='x unified')
             st.plotly_chart(fig4, use_container_width=True)
+            
+            # Scaled Production Profile
+            st.subheader("📊 Scaled Production Profile")
+            st.caption("Production profile scaled by PPA Capacity / Total Installed Capacity. Based on sidebar configuration.")
+            
+            # Get PPA configuration from session state (sidebar selections)
+            ppa_capacity_mw = st.session_state.get('ppa_capacity_mw', 1.5)
+            ppa_technology = st.session_state.get('ppa_technology', None)
+            solar_fraction = st.session_state.get('solar_fraction', None)
+            wind_fraction = st.session_state.get('wind_fraction', None)
+            
+            if ppa_technology is None:
+                st.warning("⚠️ No PPA technology selected. Please configure PPA settings in the sidebar and fetch data.")
+            else:
+                # Get installed capacity data
+                installed_capacity_df = None
+                if 'fetched_data' in st.session_state and 'installed_capacity' in st.session_state['fetched_data']:
+                    installed_capacity_df = st.session_state['fetched_data']['installed_capacity']
+                
+                if installed_capacity_df is None or installed_capacity_df.empty:
+                    st.warning("⚠️ No installed capacity data available. Please fetch data with capacity information.")
+                else:
+                    # Check if combined technology
+                    is_combined = '+' in ppa_technology
+                    
+                    if is_combined:
+                        # Combined technology - show both components
+                        tech_components = ppa_technology.split(' + ')
+                        tech_components = [t.strip() for t in tech_components]
+                        
+                        # Get fractions (default 50/50)
+                        if solar_fraction is None:
+                            fractions = [0.5, 0.5]
+                        else:
+                            fractions = [solar_fraction, wind_fraction]
+                        
+                        # Calculate production for each component
+                        fig5 = go.Figure()
+                        
+                        colors = ['#FFA500', '#4169E1']  # Orange for solar, blue for wind
+                        total_production_by_time = None
+                        
+                        for idx, (tech, fraction) in enumerate(zip(tech_components, fractions)):
+                            tech_capacity = ppa_capacity_mw * fraction
+                            
+                            # Get PSR types
+                            psr_mapping = {
+                                'Solar': ['B16'],
+                                'Wind Onshore': ['B19'],
+                                'Wind Offshore': ['B18']
+                            }
+                            psr_types = psr_mapping.get(tech, ['B16'])
+                            
+                            # Filter and group generation data
+                            tech_gen = gen_df[gen_df['psr_type'].isin(psr_types)].copy()
+                            
+                            if not tech_gen.empty:
+                                tech_by_time = tech_gen.groupby('timestamp')['generation_mw'].sum().reset_index()
+                                
+                                # Get installed capacity
+                                tech_cap = installed_capacity_df[
+                                    (installed_capacity_df['psr_type'].notna()) & 
+                                    (installed_capacity_df['psr_type'].isin(psr_types))
+                                ].copy()
+                                
+                                if not tech_cap.empty:
+                                    installed_cap = tech_cap['installed_capacity_mw'].mean()
+                                    
+                                    if installed_cap > 0:
+                                        scaling_factor = tech_capacity / installed_cap
+                                        tech_by_time['scaled_production_mw'] = tech_by_time['generation_mw'] * scaling_factor
+                                        
+                                        # Add to plot
+                                        fig5.add_trace(go.Scatter(
+                                            x=tech_by_time['timestamp'],
+                                            y=tech_by_time['scaled_production_mw'],
+                                            mode='lines',
+                                            name=f'{tech} ({fraction*100:.0f}%)',
+                                            line=dict(color=colors[idx], width=2),
+                                            stackgroup='ppa',
+                                            hovertemplate=f'<b>%{{x}}</b><br>{tech}: %{{y:.2f}} MW<extra></extra>'
+                                        ))
+                                        
+                                        # Track total production
+                                        if total_production_by_time is None:
+                                            total_production_by_time = tech_by_time[['timestamp']].copy()
+                                            total_production_by_time['total_mw'] = tech_by_time['scaled_production_mw']
+                                        else:
+                                            total_production_by_time = total_production_by_time.merge(
+                                                tech_by_time[['timestamp', 'scaled_production_mw']],
+                                                on='timestamp',
+                                                how='outer',
+                                                suffixes=('', '_new')
+                                            )
+                                            total_production_by_time['total_mw'] = total_production_by_time['total_mw'].fillna(0) + total_production_by_time['scaled_production_mw'].fillna(0)
+                                            total_production_by_time = total_production_by_time[['timestamp', 'total_mw']]
+                        
+                        if total_production_by_time is not None:
+                            # Add mean line for total production
+                            mean_total = total_production_by_time['total_mw'].mean()
+                            fig5.add_hline(
+                                y=mean_total,
+                                line_dash="dash",
+                                line_color="red",
+                                annotation_text=f"Mean Total: {mean_total:.2f} MW"
+                            )
+                            
+                            fig5.update_layout(
+                                xaxis_title="Date & Time",
+                                yaxis_title="Power (MW)",
+                                hovermode='x unified',
+                                height=500,
+                                showlegend=True,
+                                title=f"{ppa_technology} Production Profile (Total: {ppa_capacity_mw:.2f} MW PPA)"
+                            )
+                            
+                            st.plotly_chart(fig5, use_container_width=True)
+                            
+                            # Statistics
+                            st.markdown("**Portfolio Composition:**")
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric(f"{tech_components[0]} Capacity", f"{ppa_capacity_mw * fractions[0]:.2f} MW ({fractions[0]*100:.0f}%)")
+                            with col2:
+                                st.metric(f"{tech_components[1]} Capacity", f"{ppa_capacity_mw * fractions[1]:.2f} MW ({fractions[1]*100:.0f}%)")
+                            with col3:
+                                st.metric("Mean Total Production", f"{mean_total:.2f} MW")
+                        else:
+                            st.warning("⚠️ Could not calculate production for any technology component")
+                    
+                    else:
+                        # Single technology
+                        psr_types = PPA_TECHNOLOGY_PSR_TYPES.get(ppa_technology, ['B16'])
+                        
+                        # Filter generation data for the selected technology
+                        tech_generation = gen_df[gen_df['psr_type'].isin(psr_types)].copy()
+                        
+                        if tech_generation.empty:
+                            st.warning(f"⚠️ No generation data available for {ppa_technology} in this country/period")
+                        else:
+                            # Group by timestamp to get total generation for the technology
+                            tech_by_time = tech_generation.groupby('timestamp').agg({
+                                'generation_mw': 'sum'
+                            }).reset_index()
+                            
+                            # Filter installed capacity for this technology
+                            tech_capacity = installed_capacity_df[
+                                (installed_capacity_df['psr_type'].notna()) & 
+                                (installed_capacity_df['psr_type'].isin(psr_types))
+                            ].copy()
+                            
+                            if not tech_capacity.empty:
+                                total_installed_capacity_mw = tech_capacity['installed_capacity_mw'].mean()
+                                
+                                if total_installed_capacity_mw > 0:
+                                    # Calculate scaling factor
+                                    scaling_factor = ppa_capacity_mw / total_installed_capacity_mw
+                                    
+                                    # Scale the production profile
+                                    tech_by_time['scaled_production_mw'] = tech_by_time['generation_mw'] * scaling_factor
+                                    
+                                    # Display info
+                                    st.info(f"""
+                                    **Scaling Information:**
+                                    - Technology: {ppa_technology}
+                                    - Total Installed Capacity ({ppa_technology}): {total_installed_capacity_mw:.2f} MW
+                                    - PPA Capacity (from sidebar): {ppa_capacity_mw:.2f} MW
+                                    - Scaling Factor: {scaling_factor:.4f}
+                                    """)
+                                    
+                                    # Create plot
+                                    fig5 = go.Figure()
+                                    
+                                    # Original generation
+                                    fig5.add_trace(go.Scatter(
+                                        x=tech_by_time['timestamp'],
+                                        y=tech_by_time['generation_mw'],
+                                        mode='lines',
+                                        name=f'Original {ppa_technology} Generation',
+                                        line=dict(color='lightblue', width=1),
+                                        opacity=0.5,
+                                        hovertemplate='<b>%{x}</b><br>Original: %{y:.2f} MW<extra></extra>'
+                                    ))
+                                    
+                                    # Scaled production
+                                    fig5.add_trace(go.Scatter(
+                                        x=tech_by_time['timestamp'],
+                                        y=tech_by_time['scaled_production_mw'],
+                                        mode='lines',
+                                        name='Scaled PPA Production',
+                                        line=dict(color='green', width=2),
+                                        fill='tozeroy',
+                                        fillcolor='rgba(0, 255, 0, 0.2)',
+                                        hovertemplate='<b>%{x}</b><br>Scaled: %{y:.2f} MW<extra></extra>'
+                                    ))
+                                    
+                                    # Add mean line for scaled production
+                                    mean_scaled = tech_by_time['scaled_production_mw'].mean()
+                                    fig5.add_hline(
+                                        y=mean_scaled,
+                                        line_dash="dash",
+                                        line_color="red",
+                                        annotation_text=f"Mean: {mean_scaled:.2f} MW"
+                                    )
+                                    
+                                    fig5.update_layout(
+                                        xaxis_title="Date & Time",
+                                        yaxis_title="Power (MW)",
+                                        hovermode='x unified',
+                                        height=400,
+                                        showlegend=True,
+                                        title=f"{ppa_technology} Production Profile (Scaled to {ppa_capacity_mw:.2f} MW PPA)"
+                                    )
+                                    
+                                    st.plotly_chart(fig5, use_container_width=True)
+                                    
+                                    # Statistics
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    with col1:
+                                        st.metric("Mean Scaled Production", f"{mean_scaled:.2f} MW")
+                                    with col2:
+                                        st.metric("Max Scaled Production", f"{tech_by_time['scaled_production_mw'].max():.2f} MW")
+                                    with col3:
+                                        st.metric("Min Scaled Production", f"{tech_by_time['scaled_production_mw'].min():.2f} MW")
+                                    with col4:
+                                        avg_cf = (tech_by_time['generation_mw'] / total_installed_capacity_mw).mean()
+                                        st.metric("Avg Capacity Factor", f"{avg_cf*100:.1f}%")
+                                else:
+                                    st.warning("⚠️ Installed capacity is zero, cannot calculate scaling factor")
+                            else:
+                                st.warning(f"⚠️ No installed capacity data for {ppa_technology}")
             
             # Detailed data table
             st.subheader("📋 Detailed Generation Data")
@@ -841,6 +1117,294 @@ def display_data_explorer_tab():
             )
             st.caption("CSV contains: power (MW), resolution (minutes), and renewable flag. Use trapezoidal integration to calculate energy.")
 
+def run_sensitivity_analysis(data, country, temporal_correlation, ratios):
+    """
+    Run sensitivity analysis for different PPA capacity ratios and technologies.
+    
+    Args:
+        data: Dictionary with prices, generation, and installed_capacity DataFrames
+        country: Country name
+        temporal_correlation: 'hourly' or 'monthly'
+        ratios: List of PPA capacity to electrolyser capacity ratios
+    
+    Returns:
+        Dictionary with results for each technology
+    """
+    electrolyser_mw = 1.0  # Fixed at 1 MW
+    backend_country = get_backend_country_name(country)
+    
+    # Calculate renewable share once
+    if data['generation'].empty:
+        renewable_share = 0.30
+    else:
+        renewable_share = calculate_renewable_share(data['generation'], 'annual')
+    
+    # Technologies to analyze
+    technologies = {
+        'Solar': ['Solar'],
+        'Wind Onshore': ['Wind Onshore'],
+        'Wind Offshore': ['Wind Offshore'],
+        'Solar + Wind Offshore': ['Solar', 'Wind Offshore'],
+        'Solar + Wind Onshore': ['Solar', 'Wind Onshore']
+    }
+    
+    results = {}
+    
+    for tech_name, tech_list in technologies.items():
+        results[tech_name] = []
+        
+        for ratio in ratios:
+            ppa_capacity_mw = electrolyser_mw * ratio
+            
+            try:
+                # For combined technologies, split capacity 50/50
+                if len(tech_list) == 2:
+                    # Calculate production for each technology separately
+                    combined_production = None
+                    
+                    for tech in tech_list:
+                        tech_capacity = ppa_capacity_mw * 0.5  # 50% each
+                        
+                        ppa_prod_df = calculate_ppa_production_from_generation_data(
+                            generation_df=data['generation'],
+                            ppa_technology=tech,
+                            ppa_capacity_mw=tech_capacity,
+                            prices_df=data['prices'],
+                            installed_capacity_df=data.get('installed_capacity', pd.DataFrame())
+                        )
+                        
+                        if combined_production is None:
+                            combined_production = ppa_prod_df.copy()
+                        else:
+                            # Add the production from the second technology
+                            combined_production['ppa_production_mw'] += ppa_prod_df['ppa_production_mw']
+                    
+                    # Create a temporary DataFrame for calculation
+                    calc_df = data['prices'].copy()
+                    calc_df = calc_df.merge(combined_production, on='datetime', how='left')
+                    calc_df['ppa_production_mw'] = calc_df['ppa_production_mw'].fillna(0)
+                    
+                    # Prepare calculation parameters
+                    calc_params = {
+                        'electrolyser_mw': electrolyser_mw,
+                        'ppa_capacity_mw': ppa_capacity_mw,
+                        'prices_df': calc_df,
+                        'renewable_share': renewable_share,
+                        'zone_name': backend_country,
+                        'temporal_correlation': temporal_correlation,
+                        'use_price_threshold': True,
+                        'ppa_technology': None,  # We already calculated production
+                        'generation_df': pd.DataFrame()  # Empty to use our pre-calculated production
+                    }
+                    
+                    # Manually set PPA production in the dataframe
+                    result = calculate_rfnbo_compliance(**calc_params)
+                    # Override with our combined production
+                    timestep_hours = result['resolution_minutes'] / 60 if 'resolution_minutes' in result.columns else 1.0
+                    result['ppa_production_mw'] = calc_df['ppa_production_mw']
+                    result['ppa_energy_mwh'] = result['ppa_production_mw'] * timestep_hours
+                    result['grid_consumption_mw'] = (result['electrolyser_consumption_mw'] - result['ppa_production_mw']).clip(lower=0)
+                    result['grid_energy_mwh'] = result['grid_consumption_mw'] * timestep_hours
+                    
+                    # Recalculate RFNBO metrics
+                    result['rfnbo_from_ppa_mwh'] = result['ppa_energy_mwh']
+                    if isinstance(renewable_share, pd.DataFrame):
+                        result = result.merge(renewable_share, left_on='datetime', right_on='timestamp', how='left', suffixes=('', '_renewable'))
+                        result['grid_renewable_share_mix'] = result['renewable_share'].fillna(renewable_share['renewable_share'].mean())
+                    else:
+                        result['grid_renewable_share_mix'] = renewable_share
+                    result['rfnbo_from_grid_mwh'] = result['grid_energy_mwh'] * result['grid_renewable_share_mix']
+                    result['rfnbo_energy_mwh'] = result['rfnbo_from_ppa_mwh'] + result['rfnbo_from_grid_mwh']
+                    result['rfnbo_fraction'] = result['rfnbo_energy_mwh'] / result['electrolyser_consumption_mwh']
+                    result['rfnbo_fraction'] = result['rfnbo_fraction'].clip(upper=1.0)
+                    
+                else:
+                    # Single technology
+                    calc_params = {
+                        'electrolyser_mw': electrolyser_mw,
+                        'ppa_capacity_mw': ppa_capacity_mw,
+                        'prices_df': data['prices'],
+                        'renewable_share': renewable_share,
+                        'zone_name': backend_country,
+                        'temporal_correlation': temporal_correlation,
+                        'use_price_threshold': True,
+                        'ppa_technology': tech_list[0],
+                        'generation_df': data['generation'],
+                        'installed_capacity_df': data.get('installed_capacity', pd.DataFrame())
+                    }
+                    
+                    result = calculate_rfnbo_compliance(**calc_params)
+                
+                # Aggregate monthly
+                monthly = aggregate_to_monthly(result)
+                rfnbo_fraction = monthly['rfnbo_fraction'].values[0]
+                
+                results[tech_name].append({
+                    'ratio': ratio,
+                    'rfnbo_fraction': rfnbo_fraction
+                })
+                
+            except Exception as e:
+                logger.error(f"Error calculating for {tech_name} at ratio {ratio}: {str(e)}")
+                results[tech_name].append({
+                    'ratio': ratio,
+                    'rfnbo_fraction': 0
+                })
+    
+    return results
+
+def display_sensitivity_analysis_tab():
+    """Display the sensitivity analysis tab."""
+    st.header("📈 Sensitivity Analysis: PPA Sizing Impact on RFNBO Compliance")
+    st.markdown("""
+    This analysis shows how different PPA capacity ratios affect RFNBO compliance for various technologies.
+    - **X-axis**: Production to consumption ratio (PPA capacity / Electrolyser capacity)
+    - **Y-axis**: % of RFNBO H₂ (renewable hydrogen fraction)
+    - **Electrolyser**: Fixed at 1 MW
+    - **Combined technologies**: 50%/50% split between the two sources
+    """)
+    
+    # Check if data exists
+    if 'fetched_data' not in st.session_state:
+        st.info("👈 Please fetch data using the sidebar first (🚀 Fetch Data & Calculate button)")
+        return
+    
+    data = st.session_state['fetched_data']
+    
+    if data['prices'].empty or data['generation'].empty:
+        st.warning("⚠️ Complete price and generation data is required for sensitivity analysis")
+        return
+    
+    # Configuration
+    st.subheader("⚙️ Configuration")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        min_ratio = st.number_input("Min Ratio", min_value=0.0, max_value=5.0, value=0.0, step=0.1)
+        max_ratio = st.number_input("Max Ratio", min_value=0.1, max_value=10.0, value=2.0, step=0.1)
+    
+    with col2:
+        num_points = st.slider("Number of Points", min_value=10, max_value=100, value=50)
+        temporal_correlation = st.selectbox("Temporal Correlation", ['hourly', 'monthly'], 
+                                           index=0 if st.session_state.get('temporal_correlation') == 'hourly' else 1)
+    
+    if st.button("🚀 Run Sensitivity Analysis", type="primary"):
+        # Generate ratios
+        ratios = np.linspace(min_ratio, max_ratio, num_points)
+        
+        with st.spinner("Running sensitivity analysis... This may take a few minutes."):
+            country = st.session_state.get('country', 'Belgium')
+            
+            results = run_sensitivity_analysis(data, country, temporal_correlation, ratios)
+            
+            # Store in session state
+            st.session_state['sensitivity_results'] = results
+            st.session_state['sensitivity_ratios'] = ratios
+    
+    # Display results if available
+    if 'sensitivity_results' in st.session_state:
+        st.subheader("📊 Results")
+        
+        results = st.session_state['sensitivity_results']
+        
+        # Create the plot
+        fig = go.Figure()
+        
+        colors = {
+            'Solar': '#FFA500',
+            'Wind Onshore': '#8B4513',
+            'Wind Offshore': '#DC143C',
+            'Solar + Wind Offshore': '#4169E1',
+            'Solar + Wind Onshore': '#228B22'
+        }
+        
+        for tech_name, data_points in results.items():
+            if data_points:
+                x_vals = [d['ratio'] for d in data_points]
+                y_vals = [d['rfnbo_fraction'] * 100 for d in data_points]
+                
+                fig.add_trace(go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode='lines',
+                    name=tech_name,
+                    line=dict(color=colors.get(tech_name, '#000000'), width=3),
+                    hovertemplate='<b>%{fullData.name}</b><br>Ratio: %{x:.2f}<br>RFNBO: %{y:.1f}%<extra></extra>'
+                ))
+        
+        # Add 100% line
+        fig.add_hline(y=100, line_dash="dash", line_color="gray", 
+                     annotation_text="100% RFNBO Target",
+                     annotation_position="right")
+        
+        fig.update_layout(
+            xaxis_title="Production to Consumption Ratio (PPA Capacity / Electrolyser Capacity)",
+            yaxis_title="% RFNBO H₂",
+            hovermode='x unified',
+            height=600,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            yaxis=dict(range=[0, 105])
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Summary table
+        st.subheader("📋 Summary: Ratio to Reach 100% RFNBO")
+        
+        summary_data = []
+        for tech_name, data_points in results.items():
+            if data_points:
+                # Find the ratio where RFNBO >= 100%
+                reaching_100 = [d for d in data_points if d['rfnbo_fraction'] >= 1.0]
+                if reaching_100:
+                    min_ratio_100 = min(d['ratio'] for d in reaching_100)
+                    summary_data.append({
+                        'Technology': tech_name,
+                        'Min Ratio for 100% RFNBO': f"{min_ratio_100:.2f}",
+                        'PPA Capacity Needed (MW)': f"{min_ratio_100 * 1.0:.2f}"  # Electrolyser is 1 MW
+                    })
+                else:
+                    max_rfnbo = max(d['rfnbo_fraction'] for d in data_points) * 100
+                    summary_data.append({
+                        'Technology': tech_name,
+                        'Min Ratio for 100% RFNBO': f">{max_ratio:.2f} (max: {max_rfnbo:.1f}%)",
+                        'PPA Capacity Needed (MW)': f">{max_ratio:.2f}"
+                    })
+        
+        if summary_data:
+            summary_df = pd.DataFrame(summary_data)
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        
+        # Download button
+        if results:
+            # Create CSV data
+            csv_data = []
+            for tech_name, data_points in results.items():
+                for d in data_points:
+                    csv_data.append({
+                        'Technology': tech_name,
+                        'Ratio': d['ratio'],
+                        'RFNBO_Fraction': d['rfnbo_fraction'],
+                        'RFNBO_Percentage': d['rfnbo_fraction'] * 100
+                    })
+            
+            csv_df = pd.DataFrame(csv_data)
+            csv = csv_df.to_csv(index=False)
+            
+            st.download_button(
+                label="📥 Download Sensitivity Analysis Results",
+                data=csv,
+                file_name=f"sensitivity_analysis_{st.session_state.get('country', 'data')}_{st.session_state.get('year', '')}_{st.session_state.get('month', ''):02d}.csv",
+                mime="text/csv"
+            )
+
 def main():
     st.title("⚡ RFNBO Compliancy Calculator for Electrolysers")
     st.markdown("""
@@ -869,45 +1433,41 @@ def main():
     st.sidebar.subheader("🌱 PPA Configuration")
     ppa_capacity_mw = st.sidebar.number_input("PPA Capacity (MW)", min_value=0.0, max_value=10000.0, value=1.5, step=0.1)
     
-    ppa_mode = st.sidebar.radio("PPA Production Mode", ['Constant CF', 'Real Generation Data'])
+    ppa_technology = st.sidebar.selectbox(
+        "PPA Technology",
+        ['Solar', 'Wind Onshore', 'Wind Offshore', 'Solar + Wind Offshore', 'Solar + Wind Onshore'],
+        index=0
+    )
     
-    if ppa_mode == 'Constant CF':
-        ppa_capacity_factor = st.sidebar.slider("PPA Capacity Factor", min_value=0.0, max_value=1.0, value=0.35, step=0.01)
-        ppa_technology = None
-        use_real_ppa_data = False
-    else:
-        ppa_technology = st.sidebar.selectbox(
-            "PPA Technology",
-            ['Solar', 'Wind', 'Wind Onshore', 'Wind Offshore'],
-            index=0
+    # Portfolio allocation for combined technologies
+    if '+' in ppa_technology:
+        st.sidebar.caption("Combined PPA portfolio configuration:")
+        portfolio_split = st.sidebar.slider(
+            "Solar / Wind Split (%)",
+            min_value=0,
+            max_value=100,
+            value=50,
+            step=5,
+            help="Percentage of PPA capacity allocated to Solar (remainder goes to Wind)"
         )
-        ppa_capacity_factor = 0.35  # Fallback value
-        use_real_ppa_data = True
-        st.sidebar.caption("Will use actual generation data from ENTSOE for this technology")
+        solar_fraction = portfolio_split / 100
+        wind_fraction = 1 - solar_fraction
+        st.sidebar.caption(f"Solar: {solar_fraction*100:.0f}% | Wind: {wind_fraction*100:.0f}%")
+    else:
+        solar_fraction = None
+        wind_fraction = None
+    
+    st.sidebar.caption("Will use actual generation data from ENTSOE for this technology")
     
     # Temporal correlation
     st.sidebar.subheader("⏱️ Temporal Correlation")
     temporal_correlation = st.sidebar.radio("Correlation Type", ['hourly', 'monthly'])
     
-    # Renewable mix configuration
-    st.sidebar.subheader("♻️ Renewable Mix")
-    renewable_mode = st.sidebar.radio("Renewable Share Mode", ['Calculate from ENTSOE', 'Manual Input'])
-    
-    if renewable_mode == 'Manual Input':
-        manual_renewable_share = st.sidebar.slider("Renewable Share (%)", min_value=0, max_value=100, value=30) / 100
-    else:
-        renewable_temporal = st.sidebar.radio("Temporal Mode", ['annual', 'hourly'])
-    
-    # Price threshold
-    st.sidebar.subheader("💰 Price Threshold Rule")
-    use_price_threshold = st.sidebar.checkbox("Enable 20€/MWh Price Threshold Rule", value=True)
-    st.sidebar.caption(f"When enabled, grid energy below {PRICE_THRESHOLD_EUR_MWH:.0f}€/MWh is considered to have 0 emissions (100% renewable)")
-    
     # Fetch data button
     if st.sidebar.button("🚀 Fetch Data & Calculate", type="primary"):
         with st.spinner("Fetching data from ENTSOE..."):
-            # Fetch installed capacity if using real PPA data
-            fetch_capacity = use_real_ppa_data if 'use_real_ppa_data' in locals() else False
+            # Always fetch installed capacity (useful for plots, and only fetched once on first day)
+            fetch_capacity = True  # Always fetch for visualization purposes
             data = fetch_month_data(country, year, month, fetch_capacity=fetch_capacity)
         
         # Store data in session state for access from both tabs
@@ -915,26 +1475,26 @@ def main():
         st.session_state['country'] = country
         st.session_state['year'] = year
         st.session_state['month'] = month
+        st.session_state['ppa_capacity_mw'] = ppa_capacity_mw
+        st.session_state['ppa_technology'] = ppa_technology
+        st.session_state['solar_fraction'] = solar_fraction if '+' in ppa_technology else None
+        st.session_state['wind_fraction'] = wind_fraction if '+' in ppa_technology else None
         
         if data['prices'].empty:
             st.error("❌ Unable to proceed without price data")
             return
         
-        # Calculate renewable share
-        if renewable_mode == 'Manual Input':
-            renewable_share = manual_renewable_share
-            st.info(f"ℹ️ Using manual renewable share: {manual_renewable_share * 100:.1f}%")
+        # Calculate renewable share from ENTSOE (always use 'annual' mode for monthly average)
+        if data['generation'].empty:
+            st.warning("⚠️ No generation data available, using default 30% renewable share")
+            renewable_share = 0.30
         else:
-            if data['generation'].empty:
-                st.warning("⚠️ No generation data available, using default 30% renewable share")
-                renewable_share = 0.30
+            renewable_share = calculate_renewable_share(data['generation'], 'annual')
+            if isinstance(renewable_share, float):
+                st.info(f"ℹ️ Calculated monthly renewable share: {renewable_share * 100:.1f}%")
             else:
-                renewable_share = calculate_renewable_share(data['generation'], renewable_temporal)
-                if isinstance(renewable_share, float):
-                    st.info(f"ℹ️ Calculated Monthly renewable share: {renewable_share * 100:.1f}%")
-                else:
-                    avg_renewable = renewable_share['renewable_share'].mean()
-                    st.info(f"ℹ️ Calculated average hourly renewable share: {avg_renewable * 100:.1f}%")
+                avg_renewable = renewable_share['renewable_share'].mean()
+                st.info(f"ℹ️ Calculated average renewable share: {avg_renewable * 100:.1f}%")
         
         # Calculate RFNBO compliance
         with st.spinner("Calculating RFNBO compliance..."):
@@ -945,27 +1505,26 @@ def main():
             calc_params = {
                 'electrolyser_mw': electrolyser_mw,
                 'ppa_capacity_mw': ppa_capacity_mw,
-                'ppa_capacity_factor': ppa_capacity_factor,
                 'prices_df': data['prices'],
                 'renewable_share': renewable_share,
                 'zone_name': backend_country,
                 'temporal_correlation': temporal_correlation,
-                'use_price_threshold': use_price_threshold
+                'use_price_threshold': True,  # Always use price threshold (20€/MWh rule)
+                'ppa_technology': ppa_technology,
+                'generation_df': data['generation'],
+                'solar_fraction': solar_fraction,
+                'wind_fraction': wind_fraction
             }
             
-            # Add PPA technology and generation data if using real data
-            if use_real_ppa_data and not data['generation'].empty:
-                calc_params['ppa_technology'] = ppa_technology
-                calc_params['generation_df'] = data['generation']
-                
-                # Add installed capacity data if available
-                if 'installed_capacity' in data and not data['installed_capacity'].empty:
-                    calc_params['installed_capacity_df'] = data['installed_capacity']
-                    st.info(f"ℹ️ Using real {ppa_technology} generation data with actual installed capacity for PPA production")
-                else:
-                    st.info(f"ℹ️ Using real {ppa_technology} generation data (estimated capacity) for PPA production")
-            elif use_real_ppa_data and data['generation'].empty:
-                st.warning("⚠️ No generation data available, using constant capacity factor instead")
+            # Add installed capacity data if available
+            if 'installed_capacity' in data and not data['installed_capacity'].empty:
+                calc_params['installed_capacity_df'] = data['installed_capacity']
+                st.info(f"ℹ️ Using real {ppa_technology} generation data with actual installed capacity for PPA production")
+            else:
+                st.info(f"ℹ️ Using real {ppa_technology} generation data (estimated capacity) for PPA production")
+            
+            if data['generation'].empty:
+                st.warning("⚠️ No generation data available, PPA production will be estimated")
             
             results = calculate_rfnbo_compliance(**calc_params)
         
@@ -985,7 +1544,7 @@ def main():
         st.session_state['renewable_share'] = renewable_share
     
     # Create tabs for different views
-    tab1, tab2 = st.tabs(["🎯 RFNBO Analysis", "📊 ENTSOE Data Explorer"])
+    tab1, tab2, tab3 = st.tabs(["🎯 RFNBO Analysis", "📊 ENTSOE Data Explorer", "📈 Sensitivity Analysis"])
     
     with tab1:
         # RFNBO Analysis Tab
@@ -1124,6 +1683,10 @@ def main():
         # Data Explorer Tab
         display_data_explorer_tab()
     
+    with tab3:
+        # Sensitivity Analysis Tab
+        display_sensitivity_analysis_tab()
+    
     # Information section
     with st.expander("ℹ️ About RFNBO Compliance"):
         st.markdown(f"""
@@ -1149,20 +1712,24 @@ def main():
         
         **RFNBO energy calculation:**
         - RFNBO = PPA energy + (Grid energy × renewable share from energy mix)
+        - Renewable share is calculated from ENTSOE generation mix data (monthly average)
         - Temporal correlation: hourly or monthly matching
         
-        ### Grid Energy Rules
+        ### Grid Energy Rules (Applied Automatically)
         
         1. **Low-price rule** (emission factor):
            - When price < {PRICE_THRESHOLD_EUR_MWH:.0f}€/MWh → emission factor = 0
+           - This rule is always applied
            
         2. **Renewable mix** (RFNBO matching):
            - Based on actual renewable share in national energy mix from ENTSOE data
+           - Calculated as monthly average from actual generation data
         
         ### Data Sources
         
         - Day-ahead electricity prices from ENTSOE
         - Generation mix data (renewable vs non-renewable) from ENTSOE
+        - Installed capacity per production type from ENTSOE
         - Country-specific grid emission factors
         """)
 
