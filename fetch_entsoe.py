@@ -15,7 +15,11 @@ import re
 import pytz
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+# Change to logging.WARNING to reduce verbosity, logging.INFO for detailed logs
+logging.basicConfig(
+    level=logging.WARNING,  # Only show warnings and errors (change to INFO for detailed logs)
+    format='%(levelname)s:%(name)s:%(message)s'
+)
 logger = logging.getLogger(__name__)
 
 ENTSOE_API_KEY = os.getenv('ENTSOE_API_KEY', "e094c8aa-00ae-4063-8a78-1d712d2ea774")
@@ -351,91 +355,92 @@ def _xml_timeseries_to_df(xml_text: str, value_tag: str = "quantity") -> pd.Data
     logger.info(f"Created DataFrame with shape: {df.shape}")
     return df
 
-def fetch_intraday_prices(date: str, zone_name: str) -> pd.DataFrame:
-    """
-    Intraday prices (`documentType=A44`, `processType=A07`) for one zone.
-    Returns a DataFrame with the target date only, localised to the country's timezone.
-    """
-    target_date = datetime.strptime(date, "%Y-%m-%d")
-    # For intraday prices, request the full target day (00:00 to 23:00)
-    period_start = target_date.strftime("%Y%m%d0000")
-    period_end = target_date.strftime("%Y%m%d2300")
 
+def fetch_day_ahead_prices_for_period(start_date: datetime, end_date: datetime, zone_name: str) -> pd.DataFrame:
+    """
+    Fetch day-ahead prices for a date range (optimized for month-long queries).
+    
+    Args:
+        start_date: Start datetime (inclusive)
+        end_date: End datetime (inclusive)
+        zone_name: Country/zone name
+    
+    Returns:
+        DataFrame with prices for the entire period
+    """
     # Convert frontend country name to backend country name
     backend_zone_name = get_backend_country_name(zone_name)
     eic_code = BIDDING_ZONES.get(backend_zone_name)
     if not eic_code:
         raise ValueError(f"Unknown bidding zone: {backend_zone_name}")
-
+    
+    # Format dates for ENTSOE API (YYYYMMDDHHMM)
+    period_start = start_date.strftime("%Y%m%d%H%M")
+    period_end = end_date.strftime("%Y%m%d%H%M")
+    
     params = {
         "documentType": "A44",
-        "processType": "A07",  # Intraday process
+        "processType": "A01",  # Day-ahead auction process
         "in_Domain": eic_code,
         "out_Domain": eic_code,
         "periodStart": period_start,
         "periodEnd": period_end,
     }
     
-    # Log the exact parameters being sent
-    logger.info(f"ENTSO-E API parameters (intraday): {params}")
-    logger.info(f"Requesting intraday data for {backend_zone_name} (EIC: {eic_code})")
-    logger.info(f"Time period: {period_start} to {period_end}")
+    logger.info(f"Fetching prices for period: {period_start} to {period_end} for {backend_zone_name}")
     
-    # Check if we're requesting a future date
-    current_date = datetime.now().date()
-    if target_date.date() > current_date:
-        logger.warning(f"Requesting intraday data for future date {date} (current date: {current_date})")
-        logger.warning("ENTSO-E typically only provides historical data with 1-2 day delay")
-
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
-            logger.info(f"Attempt {attempt + 1}: Making ENTSO-E API request for {backend_zone_name} (intraday)")
             xml = _query_entsoe(params)
-            logger.info(f"Successfully got XML response, length: {len(xml)}")
             df = _xml_timeseries_to_df(xml, value_tag="price.amount")
-            logger.info(f"Successfully parsed XML to DataFrame, shape: {df.shape}")
             
-            # Check if we got an empty DataFrame (acknowledgement document)
             if df.empty:
-                logger.warning(f"No intraday data available for {backend_zone_name} on {date} - received acknowledgement document")
+                logger.warning(f"No price data available for {backend_zone_name} from {start_date.date()} to {end_date.date()}")
                 return df
             
-            # Keep only the target date & shift to country's timezone
-            timezone_offset = get_timezone_offset_hours(backend_zone_name, target_date)
+            # Apply timezone offset (use start_date for timezone calculation)
+            timezone_offset = get_timezone_offset_hours(backend_zone_name, start_date)
             df["datetime"] = df["timestamp"] + timedelta(hours=timezone_offset)
-            df["price_eur_mwh"] = df["value"]
-            df["zone"] = backend_zone_name  # Store backend name for database consistency
             
-            # Extract resolution information from the first record
+            # Ensure datetime is timezone-naive for comparison with naive datetime objects
+            if not df.empty:
+                if df["datetime"].dtype.name.startswith('datetime64') and hasattr(df["datetime"].dt, 'tz'):
+                    if df["datetime"].dt.tz is not None:
+                        df["datetime"] = df["datetime"].dt.tz_localize(None)
+            
+            df["price_eur_mwh"] = df["value"]
+            df["zone"] = backend_zone_name
+            
+            # Extract resolution information
             if not df.empty and "resolution_minutes" in df.columns:
-                # Convert resolution from timedelta to minutes
                 first_resolution = df.iloc[0]["resolution_minutes"]
                 if isinstance(first_resolution, pd.Timedelta):
                     resolution_minutes = int(first_resolution.total_seconds() / 60)
                 else:
                     resolution_minutes = first_resolution
-                logger.info(f"Intraday data resolution for {backend_zone_name}: {resolution_minutes} minutes")
             else:
-                # Default to hourly if no resolution info
                 resolution_minutes = 60
-                logger.info(f"No resolution info found, defaulting to {resolution_minutes} minutes for {backend_zone_name}")
             
             df["resolution_minutes"] = resolution_minutes
             df = df[["datetime", "zone", "price_eur_mwh", "resolution_minutes"]]
-            df = df[df["datetime"].dt.date == target_date.date()]
-            logger.info(f"Applied timezone offset of +{timezone_offset} hours for {backend_zone_name}")
-            logger.info(f"Final DataFrame shape: {df.shape}, columns: {df.columns.tolist()}")
-            if not df.empty:
-                logger.info(f"Sample data: {df.head().to_dict('records')}")
-            else:
-                logger.warning(f"No intraday data found for {backend_zone_name} on {date} after filtering")
+            
+            # Filter to requested date range (in local timezone)
+            # Ensure both sides of comparison are timezone-naive
+            df = df[(df["datetime"] >= start_date) & (df["datetime"] <= end_date)]
+            
+            logger.info(f"Successfully fetched {len(df)} price records for period")
             return df.reset_index(drop=True)
+            
         except requests.exceptions.RequestException as err:
             if attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)  # exponential back-off
+                time.sleep(2 ** attempt)
                 continue
             raise RuntimeError(f"Failed after {max_attempts} attempts: {err}")
+        except Exception as e:
+            # If month-long fetch fails, return empty DataFrame to trigger fallback
+            logger.warning(f"Failed to fetch prices for period {start_date.date()} to {end_date.date()}: {e}")
+            return pd.DataFrame()
 
 def fetch_day_ahead_prices(date: str, zone_name: str) -> pd.DataFrame:
     """
@@ -597,6 +602,93 @@ def fetch_generation_mix(date: str, zone_name: str, psr_type: Optional[str] = No
     return df[["timestamp", "zone", "generation_mw", "psr_type", "resolution_minutes"]]
 
 
+def fetch_all_generation_types_for_period(start_date: datetime, end_date: datetime, zone_name: str) -> pd.DataFrame:
+    """
+    Fetch all available generation types for a date range (optimized for month-long queries).
+    
+    Args:
+        start_date: Start datetime (inclusive)
+        end_date: End datetime (inclusive)
+        zone_name: Country/zone name
+    
+    Returns:
+        DataFrame with all generation sources for the entire period
+    """
+    # Convert frontend country name to backend country name
+    backend_zone_name = get_backend_country_name(zone_name)
+    eic_code = BIDDING_ZONES.get(backend_zone_name)
+    if not eic_code:
+        raise ValueError(f"Unknown bidding zone: {backend_zone_name}")
+    
+    # Format dates for ENTSOE API (YYYYMMDDHHMM)
+    period_start = start_date.strftime("%Y%m%d%H%M")
+    period_end = end_date.strftime("%Y%m%d%H%M")
+    
+    # Common generation types to fetch
+    common_psr_types = [
+        "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "B10",
+        "B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18", "B19", "B20"
+    ]
+    
+    all_data = []
+    
+    logger.info(f"Fetching generation data for period: {period_start} to {period_end} for {backend_zone_name}")
+    logger.info(f"Will fetch {len(common_psr_types)} PSR types with rate limiting to avoid 429 errors")
+    
+    for idx, psr_type in enumerate(common_psr_types):
+        try:
+            # Rate limiting: Add delay between requests to avoid 429 errors
+            # ENTSOE allows 400 requests/minute, so we space them out
+            if idx > 0:  # Don't delay before first request
+                time.sleep(0.5)  # 0.5 seconds between requests = max 120 requests/minute
+            
+            params = {
+                "documentType": "A75", 
+                "processType": "A16",
+                "in_Domain": eic_code,
+                "periodStart": period_start,
+                "periodEnd": period_end,
+                "psrType": psr_type
+            }
+            
+            logger.info(f"Fetching PSR type {psr_type} ({idx+1}/{len(common_psr_types)})...")
+            xml = _query_entsoe(params)
+            df = _xml_timeseries_to_df(xml)
+            
+            if not df.empty:
+                df = df.rename(columns={"value": "generation_mw"})
+                df["zone"] = backend_zone_name
+                df["psr_type"] = psr_type
+                all_data.append(df)
+                logger.info(f"✓ Successfully fetched {len(df)} records for PSR type {psr_type}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to fetch generation data for PSR type {psr_type} for {zone_name}: {str(e)}")
+            # If we get a 429 error, increase the delay
+            if "429" in str(e) or "too many" in str(e).lower():
+                logger.warning("Rate limit detected, adding extra delay...")
+                time.sleep(2)  # Extra delay after rate limit error
+            continue
+    
+    if not all_data:
+        logger.warning(f"No generation data available for {backend_zone_name} from {start_date.date()} to {end_date.date()}")
+        return pd.DataFrame(columns=["timestamp", "zone", "generation_mw", "psr_type", "resolution_minutes"])
+    
+    # Combine all data
+    combined_df = pd.concat(all_data, ignore_index=True)
+    
+    if not combined_df.empty:
+        # Ensure timestamp is timezone-naive for comparison with naive datetime objects
+        if combined_df["timestamp"].dtype.name.startswith('datetime64') and hasattr(combined_df["timestamp"].dt, 'tz'):
+            if combined_df["timestamp"].dt.tz is not None:
+                combined_df["timestamp"] = combined_df["timestamp"].dt.tz_localize(None)
+        
+        # Filter to requested date range
+        combined_df = combined_df[(combined_df["timestamp"] >= start_date) & (combined_df["timestamp"] <= end_date)]
+    
+    logger.info(f"Successfully fetched generation data: {len(combined_df)} records")
+    return combined_df[["timestamp", "zone", "generation_mw", "psr_type", "resolution_minutes"]]
+
 def fetch_all_generation_types(date: str, zone_name: str) -> pd.DataFrame:
     """
     Fetch all available generation types for a given country and date.
@@ -620,8 +712,12 @@ def fetch_all_generation_types(date: str, zone_name: str) -> pd.DataFrame:
     
     all_data = []
     
-    for psr_type in common_psr_types:
+    for idx, psr_type in enumerate(common_psr_types):
         try:
+            # Rate limiting: Add small delay to avoid 429 errors
+            if idx > 0:
+                time.sleep(0.2)  # Small delay between requests
+            
             params = {
                 "documentType": "A75", 
                 "processType": "A16",
@@ -643,6 +739,10 @@ def fetch_all_generation_types(date: str, zone_name: str) -> pd.DataFrame:
                 
         except Exception as e:
             logger.warning(f"Failed to fetch generation data for PSR type {psr_type} for {zone_name}: {str(e)}")
+            # If we get a 429 error, add extra delay
+            if "429" in str(e) or "too many" in str(e).lower():
+                logger.warning("Rate limit detected, adding extra delay...")
+                time.sleep(2)
             continue
     
     if not all_data:
@@ -958,6 +1058,82 @@ def fetch_load_forecast_day_ahead(date: str, zone_name: str) -> Optional[pd.Data
             return None
         else:
             raise ValueError(f"Failed to fetch load forecast for {backend_zone_name} on {date}: {str(e)}")
+
+def fetch_installed_capacity_per_type(date: str, zone_name: str, psr_type: Optional[str] = None) -> pd.DataFrame:
+    """
+    Installed Capacity Per Production Type – `A68` with `A33` (14.1.A).
+    Returns installed generation capacity by production type.
+    
+    Note: Changed from A71 to A68 as A71 is for generation forecast, not installed capacity.
+    A68 is the correct document type for installed generation capacity per type.
+    """
+    target_date = datetime.strptime(date, "%Y-%m-%d")
+    start_time = target_date.replace(hour=0, minute=0)
+    end_time = start_time + timedelta(days=1)
+    
+    # Convert frontend country name to backend country name
+    backend_zone_name = get_backend_country_name(zone_name)
+    eic_code = BIDDING_ZONES.get(backend_zone_name)
+    if not eic_code:
+        raise ValueError(f"Unknown bidding zone: {backend_zone_name}")
+
+    params = {
+        "documentType": "A68",  # Installed generation capacity per type (was A71)
+        "processType": "A33",   # Year ahead
+        "in_Domain": eic_code,
+        "periodStart": start_time.strftime("%Y%m%d%H%M"),
+        "periodEnd": end_time.strftime("%Y%m%d%H%M"),
+    }
+    
+    if psr_type:
+        params["psrType"] = psr_type
+    
+    try:
+        xml = _query_entsoe(params)
+        df = _xml_timeseries_to_df(xml)
+        
+        if df.empty:
+            logger.warning(f"No installed capacity data available for {backend_zone_name} on {date}")
+            return pd.DataFrame(columns=["timestamp", "zone", "installed_capacity_mw", "psr_type"])
+        
+        # Rename value column - this is installed capacity in MW
+        df = df.rename(columns={"value": "installed_capacity_mw"})
+        df["zone"] = backend_zone_name
+        
+        # For A68 documents, the PSR type might not be extracted from XML correctly
+        # Since we passed it as a parameter, explicitly set it
+        if psr_type:
+            df["psr_type"] = psr_type
+        
+        return df[["timestamp", "zone", "installed_capacity_mw", "psr_type"]]
+    
+    except Exception as e:
+        logger.warning(f"Failed to fetch installed capacity for {backend_zone_name}: {str(e)}")
+        return pd.DataFrame(columns=["timestamp", "zone", "installed_capacity_mw", "psr_type"])
+
+
+def fetch_installed_capacity_for_period(start_date: datetime, end_date: datetime, zone_name: str) -> pd.DataFrame:
+    """
+    Fetch installed capacity for a date range (optimized for period queries).
+    
+    Note: Installed capacity typically doesn't change during a month, so this
+    function fetches data for the start date only, which is more efficient than
+    fetching for the entire period.
+    
+    Args:
+        start_date: Start datetime (only used for reference)
+        end_date: End datetime (not used, kept for API consistency)
+        zone_name: Country/zone name
+    
+    Returns:
+        DataFrame with installed capacity (typically constant for the period)
+    """
+    # Installed capacity is typically constant, so fetch for start date only
+    date_str = start_date.strftime('%Y-%m-%d')
+    logger.info(f"Fetching installed capacity for {zone_name} (using {date_str} as reference)")
+    
+    return fetch_installed_capacity_all_types(date_str, zone_name)
+
 
 def fetch_installed_capacity_per_type(date: str, zone_name: str, psr_type: Optional[str] = None) -> pd.DataFrame:
     """

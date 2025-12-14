@@ -146,7 +146,7 @@ def is_emission_compliant(emission_factor_kwh: float) -> bool:
     return emission_factor_mj < MAX_EMISSION_FACTOR_MJ
 
 
-def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 'annual') -> Union[float, pd.DataFrame]:
+def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 'constant') -> Union[float, pd.DataFrame]:
     """
     Calculate renewable share from generation data using proper energy integration.
     
@@ -156,19 +156,19 @@ def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 
     
     Args:
         generation_df: DataFrame with generation data from ENTSOE (power in MW)
-        temporal_mode: 'annual' for single value, 'hourly' for time-varying
+        temporal_mode: 'constant' for single value, 'varying' for time-varying
     
     Returns:
-        If annual: single float value (0-1)
-        If hourly: DataFrame with timestamp and renewable_share columns
+        If constant: single float value (0-1)
+        If varying: DataFrame with timestamp and renewable_share columns
     
     Example:
         >>> gen_df = fetch_all_generation_types("2023-06-15", "Belgium")
-        >>> renewable_share = calculate_renewable_share(gen_df, 'annual')
+        >>> renewable_share = calculate_renewable_share(gen_df, 'constant')
         >>> print(f"Renewable share: {renewable_share * 100:.1f}%")
     """
     if generation_df.empty:
-        return 0.0 if temporal_mode == 'annual' else pd.DataFrame()
+        return 0.0 if temporal_mode == 'constant' else pd.DataFrame()
     
     # Add readable names and identify renewable sources
     generation_df = generation_df.copy()
@@ -204,14 +204,14 @@ def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 
     # Apply integration per PSR type to maintain data integrity
     generation_df = generation_df.groupby('psr_type', group_keys=False).apply(integrate_power_to_energy)
     
-    if temporal_mode == 'annual':
-        # Calculate annual average using integrated energy
+    if temporal_mode == 'constant':
+        # Calculate constant average using integrated energy
         total_energy = generation_df['generation_mwh'].sum()
         renewable_energy = generation_df[generation_df['is_renewable']]['generation_mwh'].sum()
         return renewable_energy / total_energy if total_energy > 0 else 0.0
     
-    else:  # hourly
-        # Group by timestamp to get hourly renewable share
+    else:  # varying
+        # Group by timestamp to get varying renewable share
         hourly = generation_df.groupby('timestamp').agg({
             'generation_mwh': 'sum'
         }).reset_index()

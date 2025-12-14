@@ -10,9 +10,12 @@ import logging
 # Import ENTSOE data fetching functions
 from fetch_entsoe import (
     fetch_day_ahead_prices, 
+    fetch_day_ahead_prices_for_period,
     fetch_generation_mix,
     fetch_all_generation_types,
+    fetch_all_generation_types_for_period,
     fetch_installed_capacity_all_types,
+    fetch_installed_capacity_for_period,
     get_backend_country_name,
     BIDDING_ZONES,
     COUNTRY_TIMEZONES
@@ -37,7 +40,11 @@ from rfnbo_calculations import (
 )
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+# Set to WARNING to reduce console noise, INFO for detailed debugging
+logging.basicConfig(
+    level=logging.WARNING,  # Only show warnings and errors
+    format='%(levelname)s:%(name)s:%(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Page configuration
@@ -50,6 +57,7 @@ st.set_page_config(
 def fetch_month_data(country: str, year: int, month: int, fetch_capacity: bool = False):
     """
     Fetch all required data for a given month from ENTSOE.
+    Optimized to fetch entire month at once, with fallback to day-by-day if needed.
     
     Args:
         country: Country name
@@ -61,70 +69,119 @@ def fetch_month_data(country: str, year: int, month: int, fetch_capacity: bool =
         dict with 'prices', 'generation', and optionally 'installed_capacity' DataFrames
     """
     # Generate date range for the month
-    start_date = datetime(year, month, 1)
+    start_date = datetime(year, month, 1, 0, 0)
     if month == 12:
-        end_date = datetime(year + 1, 1, 1) - timedelta(days=1)
+        end_date = datetime(year + 1, 1, 1, 0, 0) - timedelta(hours=1)
     else:
-        end_date = datetime(year, month + 1, 1) - timedelta(days=1)
+        end_date = datetime(year, month + 1, 1, 0, 0) - timedelta(hours=1)
     
-    date_range = pd.date_range(start_date, end_date, freq='D')
-    
-    all_prices = []
-    all_generation = []
-    all_capacity = []
+    date_range = pd.date_range(start_date.date(), end_date.date(), freq='D')
     
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    for idx, date in enumerate(date_range):
-        date_str = date.strftime('%Y-%m-%d')
-        status_text.text(f"Fetching data for {date_str}...")
-        
-        try:
-            # Fetch day-ahead prices
-            prices_df = fetch_day_ahead_prices(date_str, country)
-            if not prices_df.empty:
-                all_prices.append(prices_df)
-            
-            # Fetch generation mix
-            gen_df = fetch_all_generation_types(date_str, country)
-            if not gen_df.empty:
-                all_generation.append(gen_df)
-            
-            # Fetch installed capacity if requested (only first day needed as it's constant)
-            if fetch_capacity and idx == 0:
-                capacity_df = fetch_installed_capacity_all_types(date_str, country)
-                if not capacity_df.empty:
-                    all_capacity.append(capacity_df)
-        
-        except Exception as e:
-            logger.warning(f"Failed to fetch data for {date_str}: {e}")
-            st.warning(f"⚠️ Could not fetch complete data for {date_str}")
-        
-        progress_bar.progress((idx + 1) / len(date_range))
+    # Try optimized month-long fetch first
+    status_text.text("Attempting optimized month-long fetch...")
+    progress_bar.progress(0.1)
     
+    try:
+        # Fetch prices for entire month at once
+        prices_df = fetch_day_ahead_prices_for_period(start_date, end_date, country)
+        if prices_df.empty:
+            raise ValueError("Month-long price fetch returned empty")
+        logger.info(f"✅ Successfully fetched {len(prices_df)} price records in one call")
+        use_optimized_prices = True
+    except Exception as e:
+        logger.warning(f"Month-long price fetch failed, falling back to day-by-day: {e}")
+        use_optimized_prices = False
+        prices_df = pd.DataFrame()
+    
+    progress_bar.progress(0.3)
+    
+    try:
+        # Fetch generation for entire month at once
+        status_text.text("Fetching generation data (20 types, rate-limited to avoid API errors)...")
+        generation_df = fetch_all_generation_types_for_period(start_date, end_date, country)
+        if generation_df.empty:
+            raise ValueError("Month-long generation fetch returned empty")
+        logger.info(f"✅ Successfully fetched {len(generation_df)} generation records in one call")
+        use_optimized_generation = True
+    except Exception as e:
+        logger.warning(f"Month-long generation fetch failed, falling back to day-by-day: {e}")
+        use_optimized_generation = False
+        generation_df = pd.DataFrame()
+    
+    progress_bar.progress(0.5)
+    
+    # Fallback to day-by-day if optimized fetch failed
+    if not use_optimized_prices or not use_optimized_generation:
+        status_text.text("Using day-by-day fallback for failed requests...")
+        all_prices = [] if use_optimized_prices else []
+        all_generation = [] if use_optimized_generation else []
+        
+        for idx, date in enumerate(date_range):
+            date_str = date.strftime('%Y-%m-%d')
+            status_text.text(f"Fetching data for {date_str}...")
+            
+            try:
+                if not use_optimized_prices:
+                    day_prices = fetch_day_ahead_prices(date_str, country)
+                    if not day_prices.empty:
+                        all_prices.append(day_prices)
+                
+                if not use_optimized_generation:
+                    day_gen = fetch_all_generation_types(date_str, country)
+                    if not day_gen.empty:
+                        all_generation.append(day_gen)
+            
+            except Exception as e:
+                logger.warning(f"Failed to fetch data for {date_str}: {e}")
+                st.warning(f"⚠️ Could not fetch complete data for {date_str}")
+            
+            progress_bar.progress(0.5 + 0.4 * (idx + 1) / len(date_range))
+        
+        # Combine fallback data with optimized data
+        if not use_optimized_prices and all_prices:
+            prices_df = pd.concat(all_prices, ignore_index=True)
+        if not use_optimized_generation and all_generation:
+            generation_df = pd.concat(all_generation, ignore_index=True)
+    
+    progress_bar.progress(0.9)
+    
+    # Fetch installed capacity (constant during month, so fetch once)
+    if fetch_capacity:
+        status_text.text("Fetching installed capacity data...")
+        try:
+            capacity_df = fetch_installed_capacity_for_period(start_date, end_date, country)
+        except Exception as e:
+            logger.warning(f"Failed to fetch installed capacity: {e}")
+            capacity_df = pd.DataFrame()
+    else:
+        capacity_df = pd.DataFrame()
+    
+    progress_bar.progress(1.0)
     progress_bar.empty()
     status_text.empty()
     
     result = {}
     
-    if all_prices:
-        result['prices'] = pd.concat(all_prices, ignore_index=True)
+    if not prices_df.empty:
+        result['prices'] = prices_df
         st.success(f"✅ Fetched {len(result['prices'])} price records")
     else:
         result['prices'] = pd.DataFrame()
         st.error("❌ No price data available for this period")
     
-    if all_generation:
-        result['generation'] = pd.concat(all_generation, ignore_index=True)
+    if not generation_df.empty:
+        result['generation'] = generation_df
         st.success(f"✅ Fetched {len(result['generation'])} generation records")
     else:
         result['generation'] = pd.DataFrame()
         st.warning("⚠️ No generation data available for this period")
     
     if fetch_capacity:
-        if all_capacity:
-            result['installed_capacity'] = pd.concat(all_capacity, ignore_index=True)
+        if not capacity_df.empty:
+            result['installed_capacity'] = capacity_df
             st.success(f"✅ Fetched {len(result['installed_capacity'])} installed capacity records")
         else:
             result['installed_capacity'] = pd.DataFrame()
@@ -274,23 +331,61 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
         with col4:
             st.metric("Max PPA Production", f"{results_df['ppa_production_mw'].max():.2f} MW")
     
-    # 1. RFNBO Fraction Over Time
-    st.subheader("📊 RFNBO Fraction Over Time")
+    # 1. Grid Renewable Share Over Time
+    st.subheader("🌿 Grid Renewable Share Over Time")
+    
+    # Get renewable share from session state
+    renewable_share = st.session_state.get('renewable_share', None)
+    renewable_share_mode = st.session_state.get('renewable_share_mode', 'constant')
+    
     fig1 = go.Figure()
-    fig1.add_trace(go.Scatter(
-        x=results_df['datetime'],
-        y=results_df['rfnbo_fraction'] * 100,
-        mode='lines',
-        name='RFNBO Fraction',
-        line=dict(color='green')
-    ))
-    fig1.add_hline(y=100, line_dash="dash", line_color="red", 
-                   annotation_text="100% RFNBO Target")
+    
+    if renewable_share is not None:
+        if isinstance(renewable_share, float):
+            # Constant renewable share - plot as horizontal line
+            fig1.add_trace(go.Scatter(
+                x=results_df['datetime'],
+                y=[renewable_share * 100] * len(results_df),
+                mode='lines',
+                name='Grid Renewable Share (Constant)',
+                line=dict(color='green', width=2)
+            ))
+            st.caption(f"**Mode**: Constant renewable share ({renewable_share * 100:.1f}%)")
+        else:
+            # Varying renewable share - plot time series
+            # Merge with results to align timestamps
+            renewable_df = renewable_share.copy()
+            renewable_df = renewable_df.rename(columns={'timestamp': 'datetime'})
+            plot_data = results_df[['datetime']].merge(renewable_df, on='datetime', how='left')
+            plot_data['renewable_share'] = plot_data['renewable_share'].fillna(plot_data['renewable_share'].mean())
+            
+            fig1.add_trace(go.Scatter(
+                x=plot_data['datetime'],
+                y=plot_data['renewable_share'] * 100,
+                mode='lines',
+                name='Grid Renewable Share (Varying)',
+                line=dict(color='green', width=2)
+            ))
+            
+            # Add mean line
+            mean_renewable = plot_data['renewable_share'].mean() * 100
+            fig1.add_hline(
+                y=mean_renewable,
+                line_dash="dash",
+                line_color="darkgreen",
+                annotation_text=f"Mean: {mean_renewable:.1f}%"
+            )
+            st.caption(f"**Mode**: Varying renewable share based on energy mix (avg: {mean_renewable:.1f}%)")
+    else:
+        # Fallback if renewable share not available
+        st.warning("Renewable share data not available")
+    
     fig1.update_layout(
         xaxis_title="Date & Time",
-        yaxis_title="RFNBO Fraction (%)",
+        yaxis_title="Renewable Share (%)",
         hovermode='x unified',
-        height=400
+        height=400,
+        yaxis=dict(range=[0, 100])
     )
     st.plotly_chart(fig1, use_container_width=True)
     
@@ -468,6 +563,14 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
     
     breakdown_df = pd.DataFrame(breakdown_data)
     
+    # Ensure Emission Factor column is string type to handle '-' values
+    breakdown_df['Emission Factor (g CO₂eq/kWh)'] = breakdown_df['Emission Factor (g CO₂eq/kWh)'].astype(str)
+    breakdown_df['Total Emissions (kg CO₂eq)'] = breakdown_df['Total Emissions (kg CO₂eq)'].astype(str)
+    
+    # Convert numeric columns back to numeric where appropriate (for sorting/filtering)
+    breakdown_df['Energy (MWh)'] = pd.to_numeric(breakdown_df['Energy (MWh)'], errors='coerce')
+    breakdown_df['Percentage (%)'] = pd.to_numeric(breakdown_df['Percentage (%)'], errors='coerce')
+    
     # Display table with formatting
     def format_breakdown(val):
         """Format values, handling None/NaN"""
@@ -480,8 +583,8 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
         return str(val)
     
     st.dataframe(
-        breakdown_df.style.format(format_breakdown, subset=['Energy (MWh)', 'Percentage (%)', 'Total Emissions (kg CO₂eq)']),
-        use_container_width=True,
+        breakdown_df.style.format(format_breakdown, subset=['Energy (MWh)', 'Percentage (%)']),
+        width='stretch',  # Full width (replaced use_container_width)
         hide_index=True
     )
     
@@ -551,7 +654,7 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
     }
     
     comparison_df = pd.DataFrame(comparison_data)
-    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+    st.dataframe(comparison_df, width='stretch', hide_index=True)  # Full width (replaced use_container_width)
     
     st.caption("""
     **Key Insights:**
@@ -668,7 +771,7 @@ def display_data_explorer_tab():
                 height=350,
                 showlegend=False
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True)  # plotly_chart still uses use_container_width
             
             # Price over time chart
             st.subheader("📉 Prices Over Time")
@@ -730,7 +833,7 @@ def display_data_explorer_tab():
                 'resolution_minutes': '{:.0f}'
             })
             
-            st.dataframe(styled_df, use_container_width=True, height=400)
+            st.dataframe(styled_df, width='stretch', height=400)  # Full width (replaced use_container_width)
             
             # Download button
             csv = prices_df[['datetime', 'zone', 'price_eur_mwh', 'resolution_minutes']].to_csv(index=False)
@@ -1103,7 +1206,7 @@ def display_data_explorer_tab():
                 display_gen_df.style.format({
                     'power_mw': '{:.2f}'
                 }),
-                use_container_width=True,
+                width='stretch',  # Full width (replaced use_container_width)
                 height=400
             )
             
@@ -1137,7 +1240,7 @@ def run_sensitivity_analysis(data, country, temporal_correlation, ratios):
     if data['generation'].empty:
         renewable_share = 0.30
     else:
-        renewable_share = calculate_renewable_share(data['generation'], 'annual')
+        renewable_share = calculate_renewable_share(data['generation'], 'constant')
     
     # Technologies to analyze
     technologies = {
@@ -1381,7 +1484,7 @@ def display_sensitivity_analysis_ppa_sizing():
         
         if summary_data:
             summary_df = pd.DataFrame(summary_data)
-            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            st.dataframe(summary_df, width='stretch', hide_index=True)  # Full width (replaced use_container_width)
         
         # Download button
         if results:
@@ -1559,7 +1662,7 @@ def display_sensitivity_analysis_solar_wind_split():
         
         if optimal_data:
             optimal_df = pd.DataFrame(optimal_data)
-            st.dataframe(optimal_df, use_container_width=True, hide_index=True)
+            st.dataframe(optimal_df, width='stretch', hide_index=True)  # Full width (replaced use_container_width)
         
         # Summary insights
         st.subheader("💡 Key Insights")
@@ -1630,7 +1733,7 @@ def run_solar_wind_split_analysis(data, country, temporal_correlation, combined_
     if data['generation'].empty:
         renewable_share = 0.30
     else:
-        renewable_share = calculate_renewable_share(data['generation'], 'annual')
+        renewable_share = calculate_renewable_share(data['generation'], 'constant')
     
     results = {}
     
@@ -1749,12 +1852,21 @@ def main():
     
     st.sidebar.caption("Will use actual generation data from ENTSOE for this technology")
     
+    # Renewable Share Configuration
+    st.sidebar.subheader("🌿 Renewable Share Configuration")
+    renewable_share_mode = st.sidebar.radio(
+        "Renewable Share Calculation",
+        ['constant', 'varying'],
+        help="Constant: Uses monthly average renewable share. Varying: Uses hourly renewable share from energy mix."
+    )
+    
     # Temporal correlation
     st.sidebar.subheader("⏱️ Temporal Correlation")
     temporal_correlation = st.sidebar.radio("Correlation Type", ['hourly', 'monthly'])
     
     # Fetch data button
     if st.sidebar.button("🚀 Fetch Data & Calculate", type="primary"):
+        st.info("⏱️ **Please wait**: Fetching month-long data with rate limiting to avoid API errors. This takes ~15-20 seconds.")
         with st.spinner("Fetching data from ENTSOE..."):
             # Always fetch installed capacity (useful for plots, and only fetched once on first day)
             fetch_capacity = True  # Always fetch for visualization purposes
@@ -1769,22 +1881,27 @@ def main():
         st.session_state['ppa_technology'] = ppa_technology
         st.session_state['solar_fraction'] = solar_fraction if '+' in ppa_technology else None
         st.session_state['wind_fraction'] = wind_fraction if '+' in ppa_technology else None
+        st.session_state['renewable_share_mode'] = renewable_share_mode
         
         if data['prices'].empty:
             st.error("❌ Unable to proceed without price data")
             return
         
-        # Calculate renewable share from ENTSOE (always use 'annual' mode for monthly average)
+        # Calculate renewable share from ENTSOE based on user selection
         if data['generation'].empty:
             st.warning("⚠️ No generation data available, using default 30% renewable share")
             renewable_share = 0.30
         else:
-            renewable_share = calculate_renewable_share(data['generation'], 'annual')
+            # Use 'constant' for monthly average, 'varying' for hourly
+            renewable_share = calculate_renewable_share(data['generation'], renewable_share_mode)
             if isinstance(renewable_share, float):
-                st.info(f"ℹ️ Calculated monthly renewable share: {renewable_share * 100:.1f}%")
+                st.info(f"ℹ️ Calculated constant renewable share: {renewable_share * 100:.1f}%")
             else:
                 avg_renewable = renewable_share['renewable_share'].mean()
-                st.info(f"ℹ️ Calculated average renewable share: {avg_renewable * 100:.1f}%")
+                st.info(f"ℹ️ Calculated varying renewable share (avg: {avg_renewable * 100:.1f}%)")
+        
+        # Store renewable share in session state for plotting
+        st.session_state['renewable_share'] = renewable_share
         
         # Calculate RFNBO compliance
         with st.spinner("Calculating RFNBO compliance..."):
@@ -1943,7 +2060,7 @@ def main():
                         'EF (g CO₂eq/MJ)': '{:.2f}',
                         'RFNBO %': '{:.1%}'
                     }),
-                    use_container_width=True,
+                    width='stretch',  # Full width (replaced use_container_width)
                     height=500
                 )
                 
