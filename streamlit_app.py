@@ -1253,8 +1253,8 @@ def run_sensitivity_analysis(data, country, temporal_correlation, ratios):
     
     return results
 
-def display_sensitivity_analysis_tab():
-    """Display the sensitivity analysis tab."""
+def display_sensitivity_analysis_ppa_sizing():
+    """Display the PPA sizing sensitivity analysis tab."""
     st.header("📈 Sensitivity Analysis: PPA Sizing Impact on RFNBO Compliance")
     st.markdown("""
     This analysis shows how different PPA capacity ratios affect RFNBO compliance for various technologies.
@@ -1281,15 +1281,16 @@ def display_sensitivity_analysis_tab():
     col1, col2 = st.columns(2)
     
     with col1:
-        min_ratio = st.number_input("Min Ratio", min_value=0.0, max_value=5.0, value=0.0, step=0.1)
-        max_ratio = st.number_input("Max Ratio", min_value=0.1, max_value=10.0, value=2.0, step=0.1)
+        min_ratio = st.number_input("Min Ratio", min_value=0.0, max_value=5.0, value=0.0, step=0.1, key="ppa_sizing_min_ratio")
+        max_ratio = st.number_input("Max Ratio", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key="ppa_sizing_max_ratio")
     
     with col2:
-        num_points = st.slider("Number of Points", min_value=10, max_value=100, value=50)
+        num_points = st.slider("Number of Points", min_value=10, max_value=100, value=50, key="ppa_sizing_num_points")
         temporal_correlation = st.selectbox("Temporal Correlation", ['hourly', 'monthly'], 
-                                           index=0 if st.session_state.get('temporal_correlation') == 'hourly' else 1)
+                                           index=0 if st.session_state.get('temporal_correlation') == 'hourly' else 1,
+                                           key="ppa_sizing_temporal_correlation")
     
-    if st.button("🚀 Run Sensitivity Analysis", type="primary"):
+    if st.button("🚀 Run Sensitivity Analysis", type="primary", key="ppa_sizing_run_button"):
         # Generate ratios
         ratios = np.linspace(min_ratio, max_ratio, num_points)
         
@@ -1401,9 +1402,298 @@ def display_sensitivity_analysis_tab():
             st.download_button(
                 label="📥 Download Sensitivity Analysis Results",
                 data=csv,
-                file_name=f"sensitivity_analysis_{st.session_state.get('country', 'data')}_{st.session_state.get('year', '')}_{st.session_state.get('month', ''):02d}.csv",
+                file_name=f"sensitivity_analysis_ppa_sizing_{st.session_state.get('country', 'data')}_{st.session_state.get('year', '')}_{st.session_state.get('month', ''):02d}.csv",
                 mime="text/csv"
             )
+
+def display_sensitivity_analysis_solar_wind_split():
+    """Display the Solar/Wind split sensitivity analysis tab."""
+    st.header("🌤️ Sensitivity Analysis: Solar/Wind Portfolio Optimization")
+    st.markdown("""
+    This analysis shows how different Solar/Wind splits affect RFNBO compliance for combined portfolios.
+    - **X-axis**: Solar fraction (0 = 100% Wind, 1 = 100% Solar)
+    - **Y-axis**: % of RFNBO H₂ (renewable hydrogen fraction)
+    - **Electrolyser**: Fixed at 1 MW
+    - **Three scenarios**: PPA to Electrolyser ratios of 0.75, 1.0, and 1.25
+    """)
+    
+    # Check if data exists
+    if 'fetched_data' not in st.session_state:
+        st.info("👈 Please fetch data using the sidebar first (🚀 Fetch Data & Calculate button)")
+        return
+    
+    data = st.session_state['fetched_data']
+    
+    if data['prices'].empty or data['generation'].empty:
+        st.warning("⚠️ Complete price and generation data is required for sensitivity analysis")
+        return
+    
+    # Configuration
+    st.subheader("⚙️ Configuration")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        combined_technology = st.selectbox(
+            "Combined Technology Portfolio",
+            ['Solar + Wind Offshore', 'Solar + Wind Onshore'],
+            help="Select which combined technology to analyze",
+            key="solar_wind_split_technology"
+        )
+    
+    with col2:
+        num_points = st.slider("Number of Split Points", min_value=10, max_value=50, value=21,
+                              help="Number of points between 0% and 100% solar",
+                              key="solar_wind_split_num_points")
+        temporal_correlation = st.selectbox("Temporal Correlation", ['hourly', 'monthly'], 
+                                           index=0 if st.session_state.get('temporal_correlation') == 'hourly' else 1,
+                                           key="solar_wind_split_temporal_correlation")
+    
+    # Fixed ratios to analyze
+    ppa_ratios = [0.75, 1.0, 1.25]
+    
+    st.info(f"📊 Will analyze {num_points} different Solar/Wind splits for each of the 3 PPA ratios: {ppa_ratios}")
+    
+    if st.button("🚀 Run Solar/Wind Split Analysis", type="primary", key="solar_wind_split_run_button"):
+        # Generate solar fractions from 0 to 1
+        solar_fractions = np.linspace(0, 1, num_points)
+        
+        with st.spinner("Running Solar/Wind split analysis... This may take several minutes."):
+            country = st.session_state.get('country', 'Belgium')
+            
+            results = run_solar_wind_split_analysis(
+                data, country, temporal_correlation, 
+                combined_technology, solar_fractions, ppa_ratios
+            )
+            
+            # Store in session state
+            st.session_state['solar_wind_split_results'] = results
+            st.session_state['solar_wind_split_fractions'] = solar_fractions
+            st.session_state['solar_wind_split_ratios'] = ppa_ratios
+            st.session_state['solar_wind_split_tech'] = combined_technology
+    
+    # Display results if available
+    if 'solar_wind_split_results' in st.session_state:
+        st.subheader("📊 Results")
+        
+        results = st.session_state['solar_wind_split_results']
+        solar_fractions = st.session_state['solar_wind_split_fractions']
+        ppa_ratios = st.session_state['solar_wind_split_ratios']
+        tech_name = st.session_state['solar_wind_split_tech']
+        
+        # Create the plot
+        fig = go.Figure()
+        
+        colors = {
+            0.75: '#FF6B6B',  # Red
+            1.0: '#4ECDC4',   # Teal
+            1.25: '#45B7D1'   # Blue
+        }
+        
+        for ratio in ppa_ratios:
+            if ratio in results:
+                data_points = results[ratio]
+                x_vals = [d['solar_fraction'] * 100 for d in data_points]  # Convert to percentage
+                y_vals = [d['rfnbo_fraction'] * 100 for d in data_points]
+                
+                fig.add_trace(go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode='lines+markers',
+                    name=f'PPA/Electrolyser = {ratio}',
+                    line=dict(color=colors.get(ratio, '#000000'), width=3),
+                    marker=dict(size=6),
+                    hovertemplate='<b>Ratio: %{fullData.name}</b><br>Solar: %{x:.0f}%<br>RFNBO: %{y:.1f}%<extra></extra>'
+                ))
+        
+        # Add 100% RFNBO line
+        fig.add_hline(y=100, line_dash="dash", line_color="gray", 
+                     annotation_text="100% RFNBO Target",
+                     annotation_position="right")
+        
+        fig.update_layout(
+            xaxis_title="Solar Fraction (%)",
+            yaxis_title="% RFNBO H₂",
+            hovermode='x unified',
+            height=600,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            yaxis=dict(range=[0, 105])
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Additional analysis: Show which solar fraction is optimal for each ratio
+        st.subheader("🎯 Optimal Solar Fractions")
+        
+        optimal_data = []
+        for ratio in ppa_ratios:
+            if ratio in results:
+                data_points = results[ratio]
+                # Find the solar fraction that gets closest to 100% RFNBO without going under
+                compliant_points = [d for d in data_points if d['rfnbo_fraction'] >= 1.0]
+                
+                if compliant_points:
+                    # Find the point with minimum solar fraction that still achieves 100%
+                    optimal_point = min(compliant_points, key=lambda x: x['solar_fraction'])
+                    optimal_data.append({
+                        'PPA/Electrolyser Ratio': f"{ratio}",
+                        'Optimal Solar Fraction': f"{optimal_point['solar_fraction']*100:.1f}%",
+                        'RFNBO Achieved': f"{optimal_point['rfnbo_fraction']*100:.1f}%",
+                        'Status': '✅ 100% RFNBO Achievable'
+                    })
+                else:
+                    # Find the maximum RFNBO achieved
+                    max_point = max(data_points, key=lambda x: x['rfnbo_fraction'])
+                    optimal_data.append({
+                        'PPA/Electrolyser Ratio': f"{ratio}",
+                        'Optimal Solar Fraction': f"{max_point['solar_fraction']*100:.1f}%",
+                        'RFNBO Achieved': f"{max_point['rfnbo_fraction']*100:.1f}%",
+                        'Status': f"❌ Max {max_point['rfnbo_fraction']*100:.1f}%"
+                    })
+        
+        if optimal_data:
+            optimal_df = pd.DataFrame(optimal_data)
+            st.dataframe(optimal_df, use_container_width=True, hide_index=True)
+        
+        # Summary insights
+        st.subheader("💡 Key Insights")
+        
+        with st.expander("View Detailed Analysis", expanded=True):
+            st.markdown(f"""
+            **Portfolio Analysis for {tech_name}:**
+            
+            This analysis helps you understand the trade-offs between solar and wind in your renewable portfolio:
+            
+            - **100% Wind (0% Solar)**: Typically more stable output, but may have lower capacity factors
+            - **100% Solar (100% Solar)**: Higher daytime peaks, but zero production at night
+            - **Mixed Portfolio**: Combines complementary generation patterns for more consistent supply
+            
+            **Observations from your results:**
+            - Compare the curves to see which ratio (0.75, 1.0, or 1.25) reaches 100% RFNBO
+            - The optimal solar/wind split may differ depending on your PPA sizing
+            - A larger PPA capacity (ratio 1.25) gives more flexibility in portfolio composition
+            """)
+        
+        # Download button
+        if results:
+            # Create CSV data
+            csv_data = []
+            for ratio in ppa_ratios:
+                if ratio in results:
+                    for d in results[ratio]:
+                        csv_data.append({
+                            'Technology': tech_name,
+                            'PPA_to_Electrolyser_Ratio': ratio,
+                            'Solar_Fraction': d['solar_fraction'],
+                            'Solar_Percentage': d['solar_fraction'] * 100,
+                            'Wind_Fraction': 1 - d['solar_fraction'],
+                            'Wind_Percentage': (1 - d['solar_fraction']) * 100,
+                            'RFNBO_Fraction': d['rfnbo_fraction'],
+                            'RFNBO_Percentage': d['rfnbo_fraction'] * 100
+                        })
+            
+            csv_df = pd.DataFrame(csv_data)
+            csv = csv_df.to_csv(index=False)
+            
+            st.download_button(
+                label="📥 Download Solar/Wind Split Analysis Results",
+                data=csv,
+                file_name=f"sensitivity_analysis_solar_wind_{st.session_state.get('country', 'data')}_{st.session_state.get('year', '')}_{st.session_state.get('month', ''):02d}.csv",
+                mime="text/csv"
+            )
+
+def run_solar_wind_split_analysis(data, country, temporal_correlation, combined_technology, solar_fractions, ppa_ratios):
+    """
+    Run sensitivity analysis for different Solar/Wind splits at multiple PPA capacity ratios.
+    
+    Args:
+        data: Dictionary with prices, generation, and installed_capacity DataFrames
+        country: Country name
+        temporal_correlation: 'hourly' or 'monthly'
+        combined_technology: 'Solar + Wind Offshore' or 'Solar + Wind Onshore'
+        solar_fractions: Array of solar fractions to test (0 to 1)
+        ppa_ratios: List of PPA to electrolyser capacity ratios (e.g., [0.75, 1.0, 1.25])
+    
+    Returns:
+        Dictionary with results for each ratio
+    """
+    electrolyser_mw = 1.0  # Fixed at 1 MW
+    backend_country = get_backend_country_name(country)
+    
+    # Calculate renewable share once
+    if data['generation'].empty:
+        renewable_share = 0.30
+    else:
+        renewable_share = calculate_renewable_share(data['generation'], 'annual')
+    
+    results = {}
+    
+    for ratio in ppa_ratios:
+        results[ratio] = []
+        ppa_capacity_mw = electrolyser_mw * ratio
+        
+        for solar_fraction in solar_fractions:
+            wind_fraction = 1 - solar_fraction
+            
+            try:
+                calc_params = {
+                    'electrolyser_mw': electrolyser_mw,
+                    'ppa_capacity_mw': ppa_capacity_mw,
+                    'prices_df': data['prices'],
+                    'renewable_share': renewable_share,
+                    'zone_name': backend_country,
+                    'temporal_correlation': temporal_correlation,
+                    'use_price_threshold': True,
+                    'ppa_technology': combined_technology,
+                    'generation_df': data['generation'],
+                    'installed_capacity_df': data.get('installed_capacity', pd.DataFrame()),
+                    'solar_fraction': solar_fraction,
+                    'wind_fraction': wind_fraction
+                }
+                
+                result = calculate_rfnbo_compliance(**calc_params)
+                
+                # Aggregate monthly
+                monthly = aggregate_to_monthly(result)
+                rfnbo_fraction = monthly['rfnbo_fraction'].values[0]
+                
+                results[ratio].append({
+                    'solar_fraction': solar_fraction,
+                    'wind_fraction': wind_fraction,
+                    'rfnbo_fraction': rfnbo_fraction
+                })
+                
+            except Exception as e:
+                logger.error(f"Error calculating for ratio {ratio}, solar fraction {solar_fraction}: {str(e)}")
+                results[ratio].append({
+                    'solar_fraction': solar_fraction,
+                    'wind_fraction': wind_fraction,
+                    'rfnbo_fraction': 0
+                })
+    
+    return results
+
+def display_sensitivity_analysis_tab():
+    """Display the main sensitivity analysis tab with sub-tabs."""
+    st.header("📈 Sensitivity Analysis")
+    
+    # Create sub-tabs for different sensitivity analyses
+    sens_tab1, sens_tab2 = st.tabs([
+        "📊 PPA Sizing Analysis", 
+        "🌤️ Solar/Wind Split Analysis"
+    ])
+    
+    with sens_tab1:
+        display_sensitivity_analysis_ppa_sizing()
+    
+    with sens_tab2:
+        display_sensitivity_analysis_solar_wind_split()
 
 def main():
     st.title("⚡ RFNBO Compliancy Calculator for Electrolysers")

@@ -76,7 +76,8 @@ def calculate_emission_factor(
     ppa_energy_mwh: float,
     grid_energy_low_price_mwh: float,
     grid_energy_normal_price_mwh: float,
-    country_emission_factor: float
+    country_emission_factor: float,
+    electrolyser_consumption_mwh: float
 ) -> float:
     """
     Calculate weighted emission factor for hydrogen production.
@@ -91,17 +92,16 @@ def calculate_emission_factor(
         grid_energy_low_price_mwh: Grid energy when price < 20€/MWh in MWh
         grid_energy_normal_price_mwh: Grid energy when price ≥ 20€/MWh in MWh
         country_emission_factor: Grid emission factor in g CO₂eq/kWh
+        electrolyser_consumption_mwh: Total electrolyser energy consumption in MWh
     
     Returns:
         Weighted emission factor in g CO₂eq/kWh
     
     Example:
-        >>> calculate_emission_factor(50, 10, 40, 162)  # MWh, Belgium
+        >>> calculate_emission_factor(50, 10, 40, 162, 100)  # MWh, Belgium
         64.8  # g CO₂eq/kWh
     """
-    total_energy_mwh = ppa_energy_mwh + grid_energy_low_price_mwh + grid_energy_normal_price_mwh
-    
-    if total_energy_mwh == 0:
+    if electrolyser_consumption_mwh == 0:
         return 0.0
     
     # PPA and low-price grid have 0 emissions
@@ -109,7 +109,8 @@ def calculate_emission_factor(
     total_emissions_g = grid_energy_normal_price_mwh * 1000 * country_emission_factor  # Convert MWh to kWh
     
     # Weighted emission factor in g CO₂eq/kWh
-    emission_factor_kwh = total_emissions_g / (total_energy_mwh * 1000)
+    # Divide by electrolyser consumption (not total energy sources)
+    emission_factor_kwh = total_emissions_g / (electrolyser_consumption_mwh * 1000)
     
     return emission_factor_kwh
 
@@ -594,7 +595,8 @@ def calculate_rfnbo_compliance(
             row['ppa_energy_mwh'],
             row['grid_energy_low_price_mwh'],
             row['grid_energy_normal_price_mwh'],
-            country_emission_factor
+            country_emission_factor,
+            row['electrolyser_consumption_mwh']
         ),
         axis=1
     )
@@ -611,10 +613,10 @@ def calculate_rfnbo_compliance(
     
     # Determine renewable share for grid (from energy mix, not price rule)
     if isinstance(renewable_share, float):
-        # Annual renewable share (constant for all hours)
+        # constant for all hours
         df['grid_renewable_share_mix'] = renewable_share
     else:
-        # Hourly renewable share (time-varying)
+        # time-varying
         df = df.merge(renewable_share, left_on='datetime', right_on='timestamp', how='left', suffixes=('', '_renewable'))
         df['grid_renewable_share_mix'] = df['renewable_share'].fillna(
             renewable_share['renewable_share'].mean() if not renewable_share.empty else 0
