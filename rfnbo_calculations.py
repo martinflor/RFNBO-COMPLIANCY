@@ -146,6 +146,85 @@ def is_emission_compliant(emission_factor_kwh: float) -> bool:
     return emission_factor_mj < MAX_EMISSION_FACTOR_MJ
 
 
+def integrate_power_to_energy(
+    df: pd.DataFrame,
+    power_column: str,
+    energy_column: str,
+    resolution_column: str = 'resolution_minutes',
+    timestamp_column: str = 'timestamp'
+) -> pd.DataFrame:
+    """
+    Convert power (MW) to energy (MWh) using trapezoidal integration.
+    
+    This function applies trapezoidal integration to convert instantaneous power values
+    to energy over time. More accurate than simple rectangular integration, especially
+    when power values change significantly between timesteps.
+    
+    Args:
+        df: DataFrame with power data
+        power_column: Name of the power column (e.g., 'generation_mw', 'ppa_production_mw')
+        energy_column: Name of the output energy column (e.g., 'generation_mwh', 'ppa_energy_mwh')
+        resolution_column: Name of the resolution column (default: 'resolution_minutes')
+        timestamp_column: Name of the timestamp column (default: 'timestamp')
+    
+    Returns:
+        DataFrame with added energy column
+    
+    Example:
+        >>> df = pd.DataFrame({
+        ...     'timestamp': [datetime(2023, 1, 1, 0), datetime(2023, 1, 1, 1)],
+        ...     'power_mw': [100, 150],
+        ...     'resolution_minutes': [60, 60]
+        ... })
+        >>> result = integrate_power_to_energy(df, 'power_mw', 'energy_mwh')
+        >>> print(result['energy_mwh'].sum())  # Should be 125 MWh (average of 100 and 150)
+    """
+    if df.empty:
+        return df
+    
+    # Validate required columns exist
+    if power_column not in df.columns:
+        raise ValueError(f"Power column '{power_column}' not found in DataFrame")
+    if resolution_column not in df.columns:
+        raise ValueError(f"Resolution column '{resolution_column}' not found in DataFrame")
+    if timestamp_column not in df.columns:
+        raise ValueError(f"Timestamp column '{timestamp_column}' not found in DataFrame")
+    
+    df = df.copy()
+    
+    # Fill NaN values in power column with 0 (no power = no energy)
+    if df[power_column].isna().any():
+        df[power_column] = df[power_column].fillna(0)
+    
+    # Sort by timestamp for proper integration (time-series data should be sorted)
+    df = df.sort_values(timestamp_column).reset_index(drop=True)
+    
+    if len(df) <= 1:
+        # If only one point, use rectangular integration
+        timestep_hours = df[resolution_column].iloc[0] / 60
+        df[energy_column] = df[power_column] * timestep_hours
+        return df
+    
+    # Initialize energy column
+    df[energy_column] = 0.0
+    
+    # Trapezoidal rule: energy = 0.5 * (power[k] + power[k+1]) * timestep_hours
+    for i in range(len(df) - 1):
+        timestep_hours = df[resolution_column].iloc[i] / 60
+        # Handle NaN values by treating them as 0
+        power_i = df[power_column].iloc[i] if pd.notna(df[power_column].iloc[i]) else 0
+        power_i1 = df[power_column].iloc[i+1] if pd.notna(df[power_column].iloc[i+1]) else 0
+        power_avg = 0.5 * (power_i + power_i1)
+        df.loc[i, energy_column] = power_avg * timestep_hours
+    
+    # For the last point, use rectangular integration
+    timestep_hours = df[resolution_column].iloc[-1] / 60
+    power_last = df[power_column].iloc[-1] if pd.notna(df[power_column].iloc[-1]) else 0
+    df.loc[len(df) - 1, energy_column] = power_last * timestep_hours
+    
+    return df
+
+
 def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 'constant') -> Union[float, pd.DataFrame]:
     """
     Calculate renewable share from generation data using proper energy integration.
@@ -176,33 +255,18 @@ def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 
     generation_df['is_renewable'] = generation_df['psr_type'].isin(RENEWABLE_PSR_TYPES)
     
     # Convert power (MW) to energy (MWh) using trapezoidal integration
-    # Energy = 0.5 * (power[k] + power[k+1]) * timestep_hours
-    def integrate_power_to_energy(df_group):
-        """Apply trapezoidal integration to convert MW to MWh."""
-        df_sorted = df_group.sort_values('timestamp').copy()
-        
-        if len(df_sorted) <= 1:
-            # If only one point, use rectangular integration
-            timestep_hours = df_sorted['resolution_minutes'].iloc[0] / 60
-            df_sorted['generation_mwh'] = df_sorted['generation_mw'] * timestep_hours
-            return df_sorted
-        
-        # Trapezoidal rule: energy = 0.5 * (power[k] + power[k+1]) * timestep_hours
-        df_sorted['generation_mwh'] = 0.0
-        
-        for i in range(len(df_sorted) - 1):
-            timestep_hours = df_sorted['resolution_minutes'].iloc[i] / 60
-            power_avg = 0.5 * (df_sorted['generation_mw'].iloc[i] + df_sorted['generation_mw'].iloc[i+1])
-            df_sorted.loc[df_sorted.index[i], 'generation_mwh'] = power_avg * timestep_hours
-        
-        # For the last point, use rectangular integration
-        timestep_hours = df_sorted['resolution_minutes'].iloc[-1] / 60
-        df_sorted.loc[df_sorted.index[-1], 'generation_mwh'] = df_sorted['generation_mw'].iloc[-1] * timestep_hours
-        
-        return df_sorted
-    
     # Apply integration per PSR type to maintain data integrity
-    generation_df = generation_df.groupby('psr_type', group_keys=False).apply(integrate_power_to_energy)
+    def integrate_group(df_group):
+        """Wrapper to apply integration to each PSR type group."""
+        return integrate_power_to_energy(
+            df_group,
+            power_column='generation_mw',
+            energy_column='generation_mwh',
+            resolution_column='resolution_minutes',
+            timestamp_column='timestamp'
+        )
+    
+    generation_df = generation_df.groupby('psr_type', group_keys=False).apply(integrate_group)
     
     if temporal_mode == 'constant':
         # Calculate constant average using integrated energy
@@ -539,9 +603,25 @@ def calculate_rfnbo_compliance(
     if 'resolution_minutes' not in df.columns:
         df['resolution_minutes'] = 60  # default to hourly
     
-    # Convert power to energy (MWh)
-    timestep_hours = df['resolution_minutes'] / 60
-    df['electrolyser_consumption_mwh'] = df['electrolyser_consumption_mw'] * timestep_hours
+    # Ensure datetime column exists for integration (use datetime if available, otherwise timestamp)
+    if 'datetime' not in df.columns and 'timestamp' in df.columns:
+        df['datetime'] = df['timestamp']
+    elif 'datetime' not in df.columns:
+        # Create datetime from index if needed
+        if df.index.dtype.name.startswith('datetime'):
+            df['datetime'] = df.index
+        else:
+            # Fallback: create sequential datetime
+            df['datetime'] = pd.date_range(start='2023-01-01', periods=len(df), freq='1H')
+    
+    # Convert power to energy (MWh) using trapezoidal integration for accuracy
+    df = integrate_power_to_energy(
+        df,
+        power_column='electrolyser_consumption_mw',
+        energy_column='electrolyser_consumption_mwh',
+        resolution_column='resolution_minutes',
+        timestamp_column='datetime'
+    )
     
     # Calculate PPA production from actual generation data
     if ppa_technology is not None and generation_df is not None and not generation_df.empty:
@@ -563,11 +643,26 @@ def calculate_rfnbo_compliance(
         logger.warning("No generation data available for PPA production calculation, setting to 0")
         df['ppa_production_mw'] = 0
     
-    df['ppa_energy_mwh'] = df['ppa_production_mw'] * timestep_hours
+    # Convert PPA power to energy using trapezoidal integration
+    df = integrate_power_to_energy(
+        df,
+        power_column='ppa_production_mw',
+        energy_column='ppa_energy_mwh',
+        resolution_column='resolution_minutes',
+        timestamp_column='datetime'
+    )
     
     # Calculate grid consumption
     df['grid_consumption_mw'] = (df['electrolyser_consumption_mw'] - df['ppa_production_mw']).clip(lower=0)
-    df['grid_energy_mwh'] = df['grid_consumption_mw'] * timestep_hours
+    
+    # Convert grid power to energy using trapezoidal integration
+    df = integrate_power_to_energy(
+        df,
+        power_column='grid_consumption_mw',
+        energy_column='grid_energy_mwh',
+        resolution_column='resolution_minutes',
+        timestamp_column='datetime'
+    )
     
     # PPA can't exceed electrolyser consumption
     #df['ppa_energy_mwh'] = np.minimum(df['ppa_energy_mwh'], df['electrolyser_consumption_mwh'])
@@ -623,10 +718,11 @@ def calculate_rfnbo_compliance(
         )
     
     # Calculate RFNBO-qualifying energy
-    # RFNBO = PPA energy + (grid energy × renewable share from energy mix)
+    # RFNBO = PPA energy + Low-price grid (100%) + Normal-price grid renewable part
     df['rfnbo_from_ppa_mwh'] = df['ppa_energy_mwh']  # PPA is 100% RFNBO
-    df['rfnbo_from_grid_mwh'] = df['grid_energy_mwh'] * df['grid_renewable_share_mix']
-    df['rfnbo_energy_mwh'] = df['rfnbo_from_ppa_mwh'] + df['rfnbo_from_grid_mwh']
+    df['rfnbo_from_grid_low_price_mwh'] = df['grid_energy_low_price_mwh']  # Low-price grid is 100% RFNBO
+    df['rfnbo_from_grid_normal_price_mwh'] = df['grid_energy_normal_price_mwh'] * df['grid_renewable_share_mix']  # Normal-price grid: only renewable part
+    df['rfnbo_energy_mwh'] = df['rfnbo_from_ppa_mwh'] + df['rfnbo_from_grid_low_price_mwh'] + df['rfnbo_from_grid_normal_price_mwh']
     
     # Calculate RFNBO fraction
     df['rfnbo_fraction'] = df['rfnbo_energy_mwh'] / df['electrolyser_consumption_mwh']
@@ -815,28 +911,17 @@ def calculate_generation_statistics(generation_df: pd.DataFrame) -> dict:
     gen_df['is_renewable'] = gen_df['psr_type'].isin(RENEWABLE_PSR_TYPES)
     
     # Integrate power to energy using trapezoidal rule
-    def integrate_power_to_energy(df_group):
-        """Apply trapezoidal integration to convert MW to MWh."""
-        df_sorted = df_group.sort_values('timestamp').copy()
-        
-        if len(df_sorted) <= 1:
-            timestep_hours = df_sorted['resolution_minutes'].iloc[0] / 60
-            df_sorted['generation_mwh'] = df_sorted['generation_mw'] * timestep_hours
-            return df_sorted
-        
-        df_sorted['generation_mwh'] = 0.0
-        
-        for i in range(len(df_sorted) - 1):
-            timestep_hours = df_sorted['resolution_minutes'].iloc[i] / 60
-            power_avg = 0.5 * (df_sorted['generation_mw'].iloc[i] + df_sorted['generation_mw'].iloc[i+1])
-            df_sorted.loc[df_sorted.index[i], 'generation_mwh'] = power_avg * timestep_hours
-        
-        timestep_hours = df_sorted['resolution_minutes'].iloc[-1] / 60
-        df_sorted.loc[df_sorted.index[-1], 'generation_mwh'] = df_sorted['generation_mw'].iloc[-1] * timestep_hours
-        
-        return df_sorted
+    def integrate_group(df_group):
+        """Wrapper to apply integration to each PSR type group."""
+        return integrate_power_to_energy(
+            df_group,
+            power_column='generation_mw',
+            energy_column='generation_mwh',
+            resolution_column='resolution_minutes',
+            timestamp_column='timestamp'
+        )
     
-    gen_df = gen_df.groupby('psr_type', group_keys=False).apply(integrate_power_to_energy)
+    gen_df = gen_df.groupby('psr_type', group_keys=False).apply(integrate_group)
     
     total_gen = gen_df['generation_mwh'].sum()
     renewable_gen = gen_df[gen_df['is_renewable']]['generation_mwh'].sum()

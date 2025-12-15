@@ -400,9 +400,14 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
         stackgroup='one',
         line=dict(color='green')
     ))
+    
+    # Calculate total grid RFNBO (low-price + normal-price renewable part)
+    results_df['grid_rfnbo_total'] = results_df['rfnbo_from_grid_low_price_mwh'] + results_df['rfnbo_from_grid_normal_price_mwh']
+    results_df['grid_non_rfnbo_total'] = results_df['grid_energy_mwh'] - results_df['grid_rfnbo_total']
+    
     fig2.add_trace(go.Scatter(
         x=results_df['datetime'],
-        y=results_df['rfnbo_from_grid_mwh'],
+        y=results_df['grid_rfnbo_total'],
         mode='lines',
         name='Grid (RFNBO)',
         stackgroup='one',
@@ -410,7 +415,7 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
     ))
     fig2.add_trace(go.Scatter(
         x=results_df['datetime'],
-        y=results_df['grid_energy_mwh'] - results_df['rfnbo_from_grid_mwh'],
+        y=results_df['grid_non_rfnbo_total'],
         mode='lines',
         name='Grid (Non-RFNBO)',
         stackgroup='one',
@@ -1309,15 +1314,25 @@ def run_sensitivity_analysis(data, country, temporal_correlation, ratios):
                     result['grid_consumption_mw'] = (result['electrolyser_consumption_mw'] - result['ppa_production_mw']).clip(lower=0)
                     result['grid_energy_mwh'] = result['grid_consumption_mw'] * timestep_hours
                     
-                    # Recalculate RFNBO metrics
+                    # Recalculate RFNBO metrics with correct methodology
                     result['rfnbo_from_ppa_mwh'] = result['ppa_energy_mwh']
+                    
+                    # Split grid by price
+                    result['is_low_price'] = result['price_eur_mwh'] < 20.0
+                    result['grid_energy_low_price_mwh'] = result['grid_energy_mwh'] * result['is_low_price'].astype(float)
+                    result['grid_energy_normal_price_mwh'] = result['grid_energy_mwh'] * (~result['is_low_price']).astype(float)
+                    
+                    # Get renewable share
                     if isinstance(renewable_share, pd.DataFrame):
                         result = result.merge(renewable_share, left_on='datetime', right_on='timestamp', how='left', suffixes=('', '_renewable'))
                         result['grid_renewable_share_mix'] = result['renewable_share'].fillna(renewable_share['renewable_share'].mean())
                     else:
                         result['grid_renewable_share_mix'] = renewable_share
-                    result['rfnbo_from_grid_mwh'] = result['grid_energy_mwh'] * result['grid_renewable_share_mix']
-                    result['rfnbo_energy_mwh'] = result['rfnbo_from_ppa_mwh'] + result['rfnbo_from_grid_mwh']
+                    
+                    # RFNBO = PPA + Low-price grid (100%) + Normal-price grid renewable part
+                    result['rfnbo_from_grid_low_price_mwh'] = result['grid_energy_low_price_mwh']
+                    result['rfnbo_from_grid_normal_price_mwh'] = result['grid_energy_normal_price_mwh'] * result['grid_renewable_share_mix']
+                    result['rfnbo_energy_mwh'] = result['rfnbo_from_ppa_mwh'] + result['rfnbo_from_grid_low_price_mwh'] + result['rfnbo_from_grid_normal_price_mwh']
                     result['rfnbo_fraction'] = result['rfnbo_energy_mwh'] / result['electrolyser_consumption_mwh']
                     result['rfnbo_fraction'] = result['rfnbo_fraction'].clip(upper=1.0)
                     
