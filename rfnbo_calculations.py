@@ -8,7 +8,6 @@ Separated from the Streamlit UI for better maintainability and testing.
 import pandas as pd
 import numpy as np
 import logging
-from typing import Union
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -73,46 +72,42 @@ PPA_TECHNOLOGY_PSR_TYPES = {
 
 
 def calculate_emission_factor(
-    ppa_energy_mwh: float,
-    grid_energy_low_price_mwh: float,
-    grid_energy_normal_price_mwh: float,
+    e_nres_mwh: float,
     country_emission_factor: float,
     electrolyser_consumption_mwh: float
 ) -> float:
     """
-    Calculate weighted emission factor for hydrogen production.
-    
-    Emission sources:
-    - PPA energy: 0 g CO₂eq/kWh (renewable)
-    - Grid energy at low prices (<20€/MWh): 0 g CO₂eq/kWh (considered renewable)
-    - Grid energy at normal prices: country emission factor g CO₂eq/kWh
-    
+    Calculate GHG emission factor for hydrogen production.
+
+    Formula: EF_H2 = E_NRES * EF_grid / E_H2
+
+    Where:
+    - E_NRES = non-renewable energy = max(E_H2 - E_totalRES, 0)
+    - E_totalRES = E_PPA + E_DAPrices  (PPA + grid when DA price < 20€/MWh)
+    - EF_grid = country grid emission factor [g CO₂eq/kWh]
+    - E_H2 = total electrolyser consumption
+
+    Only non-renewable energy (normal-price grid above the PPA supply) contributes
+    to GHG emissions; PPA and low-price grid energy are treated as zero-emission.
+
     Args:
-        ppa_energy_mwh: Energy from PPA in MWh
-        grid_energy_low_price_mwh: Grid energy when price < 20€/MWh in MWh
-        grid_energy_normal_price_mwh: Grid energy when price ≥ 20€/MWh in MWh
-        country_emission_factor: Grid emission factor in g CO₂eq/kWh
-        electrolyser_consumption_mwh: Total electrolyser energy consumption in MWh
-    
+        e_nres_mwh: Non-renewable energy consumed by electrolyser [MWh]
+        country_emission_factor: Grid emission factor [g CO₂eq/kWh]
+        electrolyser_consumption_mwh: Total electrolyser energy consumption [MWh]
+
     Returns:
-        Weighted emission factor in g CO₂eq/kWh
-    
+        Emission factor in g CO₂eq/kWh
+
     Example:
-        >>> calculate_emission_factor(50, 10, 40, 162, 100)  # MWh, Belgium
+        >>> calculate_emission_factor(40, 162, 100)  # 40 MWh non-renewable, Belgium
         64.8  # g CO₂eq/kWh
     """
     if electrolyser_consumption_mwh == 0:
         return 0.0
-    
-    # PPA and low-price grid have 0 emissions
-    # Only normal-price grid contributes to emissions
-    total_emissions_g = grid_energy_normal_price_mwh * 1000 * country_emission_factor  # Convert MWh to kWh
-    
-    # Weighted emission factor in g CO₂eq/kWh
-    # Divide by electrolyser consumption (not total energy sources)
-    emission_factor_kwh = total_emissions_g / (electrolyser_consumption_mwh * 1000)
-    
-    return emission_factor_kwh
+
+    # EF_H2 = E_NRES * EF_grid / E_H2
+    # Units: MWh * (g CO₂eq/kWh) / MWh  →  g CO₂eq/kWh  (MWh cancels)
+    return e_nres_mwh * country_emission_factor / electrolyser_consumption_mwh
 
 
 def convert_emission_factor_kwh_to_mj(emission_factor_kwh: float) -> float:
@@ -225,37 +220,41 @@ def integrate_power_to_energy(
     return df
 
 
-def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 'constant') -> Union[float, pd.DataFrame]:
+def calculate_renewable_share(generation_df: pd.DataFrame) -> float:
     """
     Calculate renewable share from generation data using proper energy integration.
-    
-    This function analyzes the generation mix data from ENTSOE to determine
-    what fraction of electricity generation comes from renewable sources.
-    Uses trapezoidal integration to convert power (MW) to energy (MWh).
-    
+
+    Computes the fraction of total electricity generation (over the full period)
+    that comes from renewable sources. A single constant value is returned and
+    applied uniformly as α_gridRES in the RFNBO calculation — in line with the
+    regulation, which does not allow time-varying grid renewable-share values.
+
+    Uses trapezoidal integration to convert power (MW) to energy (MWh) before
+    computing the share, so varying time-step resolutions are handled correctly.
+
     Args:
-        generation_df: DataFrame with generation data from ENTSOE (power in MW)
-        temporal_mode: 'constant' for single value, 'varying' for time-varying
-    
+        generation_df: DataFrame with generation data from ENTSOE (power in MW).
+                       Must contain columns: psr_type, generation_mw,
+                       resolution_minutes, timestamp.
+
     Returns:
-        If constant: single float value (0-1)
-        If varying: DataFrame with timestamp and renewable_share columns
-    
+        Renewable share as a float in [0, 1].
+
     Example:
         >>> gen_df = fetch_all_generation_types("2023-06-15", "Belgium")
-        >>> renewable_share = calculate_renewable_share(gen_df, 'constant')
-        >>> print(f"Renewable share: {renewable_share * 100:.1f}%")
+        >>> alpha = calculate_renewable_share(gen_df)
+        >>> print(f"Renewable share: {alpha * 100:.1f}%")
     """
     if generation_df.empty:
-        return 0.0 if temporal_mode == 'constant' else pd.DataFrame()
-    
+        return 0.0
+
     # Add readable names and identify renewable sources
     generation_df = generation_df.copy()
     generation_df['source_type'] = generation_df['psr_type'].map(PSR_TYPE_MAPPING)
     generation_df['is_renewable'] = generation_df['psr_type'].isin(RENEWABLE_PSR_TYPES)
-    
+
     # Convert power (MW) to energy (MWh) using trapezoidal integration
-    # Apply integration per PSR type to maintain data integrity
+    # Applied per PSR type to maintain data integrity across different resolutions
     def integrate_group(df_group):
         """Wrapper to apply integration to each PSR type group."""
         return integrate_power_to_energy(
@@ -265,36 +264,12 @@ def calculate_renewable_share(generation_df: pd.DataFrame, temporal_mode: str = 
             resolution_column='resolution_minutes',
             timestamp_column='timestamp'
         )
-    
+
     generation_df = generation_df.groupby('psr_type', group_keys=False).apply(integrate_group)
-    
-    if temporal_mode == 'constant':
-        # Calculate constant average using integrated energy
-        total_energy = generation_df['generation_mwh'].sum()
-        renewable_energy = generation_df[generation_df['is_renewable']]['generation_mwh'].sum()
-        return renewable_energy / total_energy if total_energy > 0 else 0.0
-    
-    else:  # varying
-        # Group by timestamp to get varying renewable share
-        hourly = generation_df.groupby('timestamp').agg({
-            'generation_mwh': 'sum'
-        }).reset_index()
-        
-        renewable_hourly = generation_df[generation_df['is_renewable']].groupby('timestamp').agg({
-            'generation_mwh': 'sum'
-        }).reset_index()
-        
-        hourly = hourly.merge(
-            renewable_hourly, 
-            on='timestamp', 
-            how='left', 
-            suffixes=('_total', '_renewable')
-        )
-        hourly['generation_mwh_renewable'] = hourly['generation_mwh_renewable'].fillna(0)
-        hourly['renewable_share'] = hourly['generation_mwh_renewable'] / hourly['generation_mwh_total']
-        hourly['renewable_share'] = hourly['renewable_share'].fillna(0)
-        
-        return hourly[['timestamp', 'renewable_share']]
+
+    total_energy = generation_df['generation_mwh'].sum()
+    renewable_energy = generation_df[generation_df['is_renewable']]['generation_mwh'].sum()
+    return renewable_energy / total_energy if total_energy > 0 else 0.0
 
 
 def get_grid_emission_factor(zone_name: str) -> float:
@@ -518,7 +493,7 @@ def calculate_rfnbo_compliance(
     electrolyser_mw: float,
     ppa_capacity_mw: float,
     prices_df: pd.DataFrame,
-    renewable_share: Union[float, pd.DataFrame],
+    renewable_share: float,
     zone_name: str,
     temporal_correlation: str = 'hourly',
     use_price_threshold: bool = True,
@@ -530,53 +505,86 @@ def calculate_rfnbo_compliance(
 ) -> pd.DataFrame:
     """
     Calculate RFNBO compliance for electrolyser operation.
-    
-    This implements the correct RFNBO methodology:
-    
-    1. **Emission Factor Calculation**:
-       - PPA energy: 0 g CO₂eq/kWh (renewable)
-       - Grid energy when price < 20€/MWh: 0 g CO₂eq/kWh (considered renewable)
-       - Grid energy when price ≥ 20€/MWh: country emission factor
-       - Calculate weighted emission factor
-       - Check: emission factor < 28.2 g CO₂eq/MJ (30% of fossil comparator)
-    
-    2. **RFNBO Percentage Calculation**:
-       - RFNBO energy = PPA energy + (grid energy × renewable share from energy mix)
-       - Calculate temporal matching (hourly or monthly)
-       - RFNBO % = (RFNBO energy / electrolyser consumption) × 100%
-    
+
+    All calculations are performed at hourly granularity. Monthly aggregation
+    is handled separately in aggregate_to_monthly().
+
+    Methodology
+    -----------
+    **Step 1 – Hourly energy flows**
+
+    E_H2   = electrolyser consumption [MWh] (trapezoidal integration of MW)
+    E_PPA  = PPA renewable generation, capped at E_H2 [MWh]
+    E_grid = max(E_H2 − E_PPA, 0)  →  electricity imported from the grid [MWh]
+
+    Applying the DA-price rule (when use_price_threshold=True):
+        E_DAPrices = E_grid   if DA price < 20 €/MWh
+        E_DAPrices = 0        otherwise
+
+    E_totalRES = E_PPA + E_DAPrices       (total renewable energy for GHG check)
+    E_NRES     = max(E_H2 − E_totalRES, 0)  (non-renewable energy)
+
+    **Step 2 – GHG Emission Factor** (hourly, then aggregated for monthly check)
+
+        EF_H2 = Σ(E_NRES) × EF_grid / Σ(E_H2)
+
+    Hourly: EF_H2_h = E_NRES_h × EF_grid / E_H2_h
+    Monthly: EF_H2_m = Σ_month(E_NRES_h) × EF_grid / Σ_month(E_H2_h)
+
+    Compliant if EF_H2 < 28.2 g CO₂eq/MJ (= 30 % of 94 g CO₂eq/MJ fossil ref.)
+
+    **Step 3 – RFNBO Share** (temporal-correlation window: hourly or monthly)
+
+        E_gridRES = E_grid × α_gridRES   (grid renewable mix share)
+        E_RFNBO   = E_H2               if DA price < 20 €/MWh
+        E_RFNBO   = E_PPA + E_gridRES  otherwise
+
+        %H2_RFNBO = 100 × Σ(E_RFNBO) / Σ(E_H2)
+        (Σ window = 1 h for hourly correlation, full period for monthly)
+
     Args:
-        electrolyser_mw: Electrolyser capacity in MW
-        ppa_capacity_mw: PPA renewable capacity in MW
-        prices_df: DataFrame with day-ahead prices from ENTSOE
-        renewable_share: Either float (annual) or DataFrame (hourly) with renewable share
-        zone_name: Country/zone name for emission factor lookup
-        temporal_correlation: 'hourly' or 'monthly'
-        use_price_threshold: Whether to apply 20€/MWh price rule
-        ppa_technology: PPA technology type ('Solar', 'Wind', etc.) - uses real generation data
-        generation_df: DataFrame with generation data - calculates actual PPA production
-        installed_capacity_df: DataFrame with installed capacity data - uses for accurate scaling
-    
+        electrolyser_mw: Electrolyser capacity [MW]
+        ppa_capacity_mw: PPA installed capacity [MW]
+        prices_df: DataFrame with day-ahead prices (must contain 'price_eur_mwh')
+        renewable_share: Constant float with the grid renewable mix share (α_gridRES)
+                         for the studied country (per regulation, a single value
+                         applies uniformly — no time-varying share is allowed)
+        zone_name: Country/zone name – used for EF_grid lookup
+        temporal_correlation: 'hourly' or 'monthly' (affects aggregation in
+                              aggregate_to_monthly, not the hourly output here)
+        use_price_threshold: Apply the 20 €/MWh DA-price rule (default True)
+        ppa_technology: PPA technology ('Solar', 'Wind Onshore', etc.)
+        generation_df: ENTSOE generation data for PPA production scaling
+        installed_capacity_df: ENTSOE installed-capacity data for accurate scaling
+        solar_fraction: Solar share of combined PPA capacity (default 0.5)
+        wind_fraction: Wind share of combined PPA capacity (default 0.5)
+
     Returns:
-        DataFrame with hourly results including:
-        - datetime: Timestamp
-        - electrolyser_consumption_mw: Electrolyser power consumption
-        - electrolyser_consumption_mwh: Electrolyser energy consumption
-        - ppa_energy_mwh: Energy from PPA
-        - grid_energy_low_price_mwh: Grid energy when price < 20€/MWh
-        - grid_energy_normal_price_mwh: Grid energy when price ≥ 20€/MWh
-        - emission_factor_kwh: Emission factor in g CO₂eq/kWh
-        - emission_factor_mj: Emission factor in g CO₂eq/MJ
-        - is_emission_compliant: Boolean - emission check
-        - rfnbo_energy_mwh: Total RFNBO-qualifying energy
-        - rfnbo_fraction: RFNBO fraction (0-1)
-        - is_rfnbo_100pct: Boolean - 100% RFNBO check
-    
+        DataFrame with one row per hour containing:
+        - datetime                      : timestamp
+        - electrolyser_consumption_mw   : electrolyser power [MW]
+        - electrolyser_consumption_mwh  : E_H2 [MWh]
+        - ppa_energy_mwh                : E_PPA [MWh]
+        - grid_energy_mwh               : E_grid [MWh]
+        - grid_energy_low_price_mwh     : E_DAPrices [MWh]
+        - grid_energy_normal_price_mwh  : E_grid at normal price [MWh]
+        - e_total_res_mwh               : E_totalRES [MWh]
+        - e_nres_mwh                    : E_NRES [MWh]
+        - total_emissions_g_co2eq       : E_NRES × EF_grid [g CO₂eq]
+        - emission_factor_kwh           : hourly EF_H2 [g CO₂eq/kWh]
+        - emission_factor_mj            : hourly EF_H2 [g CO₂eq/MJ]
+        - is_emission_compliant         : EF_H2 < 28.2 g CO₂eq/MJ
+        - e_grid_res_mwh                : E_gridRES [MWh]
+        - rfnbo_energy_mwh              : E_RFNBO [MWh]
+        - rfnbo_fraction                : E_RFNBO / E_H2 (hourly, 0–1)
+        - is_rfnbo_100pct               : rfnbo_fraction >= 1.0
+        - is_compliant                  : emission_compliant AND rfnbo_100pct
+
     Example:
         >>> prices_df = fetch_day_ahead_prices("2023-06-15", "Belgium")
         >>> gen_df = fetch_all_generation_types("2023-06-15", "Belgium")
         >>> capacity_df = fetch_installed_capacity_all_types("2023-06-15", "Belgium")
-        >>> renewable_share = calculate_renewable_share(gen_df, 'annual')
+        >>> renewable_share = calculate_renewable_share(gen_df)
         >>> results = calculate_rfnbo_compliance(
         ...     electrolyser_mw=1.0,
         ...     ppa_capacity_mw=1.5,
@@ -591,30 +599,31 @@ def calculate_rfnbo_compliance(
     """
     if prices_df.empty:
         return pd.DataFrame()
-    
-    # Get grid emission factor for this country
+
+    # Grid emission factor for this country [g CO₂eq/kWh]
     country_emission_factor = get_grid_emission_factor(zone_name)
-    
-    # Create base dataframe
+
+    # -----------------------------------------------------------------------
+    # Base dataframe setup
+    # -----------------------------------------------------------------------
     df = prices_df.copy()
     df['electrolyser_consumption_mw'] = electrolyser_mw
-    
-    # Add resolution column if not present
+
     if 'resolution_minutes' not in df.columns:
         df['resolution_minutes'] = 60  # default to hourly
-    
-    # Ensure datetime column exists for integration (use datetime if available, otherwise timestamp)
+
+    # Ensure a 'datetime' column exists for integration
     if 'datetime' not in df.columns and 'timestamp' in df.columns:
         df['datetime'] = df['timestamp']
     elif 'datetime' not in df.columns:
-        # Create datetime from index if needed
         if df.index.dtype.name.startswith('datetime'):
             df['datetime'] = df.index
         else:
-            # Fallback: create sequential datetime
             df['datetime'] = pd.date_range(start='2023-01-01', periods=len(df), freq='1H')
-    
-    # Convert power to energy (MWh) using trapezoidal integration for accuracy
+
+    # -----------------------------------------------------------------------
+    # E_H2 – electrolyser consumption [MWh]  (trapezoidal integration)
+    # -----------------------------------------------------------------------
     df = integrate_power_to_energy(
         df,
         power_column='electrolyser_consumption_mw',
@@ -622,10 +631,11 @@ def calculate_rfnbo_compliance(
         resolution_column='resolution_minutes',
         timestamp_column='datetime'
     )
-    
-    # Calculate PPA production from actual generation data
+
+    # -----------------------------------------------------------------------
+    # E_PPA – PPA renewable generation [MWh]
+    # -----------------------------------------------------------------------
     if ppa_technology is not None and generation_df is not None and not generation_df.empty:
-        # Use actual generation data for the selected technology
         ppa_production_df = calculate_ppa_production_from_generation_data(
             generation_df=generation_df,
             ppa_technology=ppa_technology,
@@ -636,168 +646,259 @@ def calculate_rfnbo_compliance(
             wind_fraction=wind_fraction
         )
         df = df.merge(ppa_production_df, on='datetime', how='left')
-        # Fill any missing values with 0 (no PPA production)
         df['ppa_production_mw'] = df['ppa_production_mw'].fillna(0)
     else:
-        # No generation data available - set PPA production to 0
         logger.warning("No generation data available for PPA production calculation, setting to 0")
         df['ppa_production_mw'] = 0
-    
-    # Convert PPA power to energy using trapezoidal integration
+
+    # Convert PPA power → energy [MWh]
     df = integrate_power_to_energy(
         df,
         power_column='ppa_production_mw',
-        energy_column='ppa_energy_mwh',
+        energy_column='ppa_energy_mwh_raw',
         resolution_column='resolution_minutes',
         timestamp_column='datetime'
     )
-    
-    # Calculate grid consumption
-    df['grid_consumption_mw'] = (df['electrolyser_consumption_mw'] - df['ppa_production_mw']).clip(lower=0)
-    
-    # Convert grid power to energy using trapezoidal integration
-    df = integrate_power_to_energy(
-        df,
-        power_column='grid_consumption_mw',
-        energy_column='grid_energy_mwh',
-        resolution_column='resolution_minutes',
-        timestamp_column='datetime'
+
+    # E_PPA capped at E_H2 (cannot use more PPA than the electrolyser consumes)
+    df['ppa_energy_mwh'] = np.minimum(df['ppa_energy_mwh_raw'], df['electrolyser_consumption_mwh'])
+    df.drop(columns=['ppa_energy_mwh_raw'], inplace=True)
+
+    # -----------------------------------------------------------------------
+    # E_grid = max(E_H2 − E_PPA, 0)  →  grid imports [MWh]
+    # -----------------------------------------------------------------------
+    df['grid_energy_mwh'] = (df['electrolyser_consumption_mwh'] - df['ppa_energy_mwh']).clip(lower=0)
+
+    # -----------------------------------------------------------------------
+    # DA-price threshold rule
+    # -----------------------------------------------------------------------
+    df['is_low_price'] = (
+        df['price_eur_mwh'] < PRICE_THRESHOLD_EUR_MWH if use_price_threshold else False
     )
-    
-    # PPA can't exceed electrolyser consumption
-    #df['ppa_energy_mwh'] = np.minimum(df['ppa_energy_mwh'], df['electrolyser_consumption_mwh'])
-    
-    # Identify low-price periods (< 20€/MWh)
-    df['is_low_price'] = df['price_eur_mwh'] < PRICE_THRESHOLD_EUR_MWH if use_price_threshold else False
-    
-    # Split grid energy by price level
+
+    # E_DAPrices = E_grid when price < 20 €/MWh, else 0
     df['grid_energy_low_price_mwh'] = df['grid_energy_mwh'] * df['is_low_price'].astype(float)
+    # Grid energy at normal prices (≥ 20 €/MWh)
     df['grid_energy_normal_price_mwh'] = df['grid_energy_mwh'] * (~df['is_low_price']).astype(float)
-    
+
+    # -----------------------------------------------------------------------
+    # E_totalRES = E_PPA + E_DAPrices
+    # E_NRES     = max(E_H2 − E_totalRES, 0)
+    # -----------------------------------------------------------------------
+    df['e_total_res_mwh'] = df['ppa_energy_mwh'] + df['grid_energy_low_price_mwh']
+    df['e_nres_mwh'] = (df['electrolyser_consumption_mwh'] - df['e_total_res_mwh']).clip(lower=0)
+
     # ============================================
-    # PART 1: EMISSION FACTOR CALCULATION
+    # PART 1: GHG EMISSION FACTOR  (hourly)
+    # EF_H2_h = E_NRES_h × EF_grid / E_H2_h
     # ============================================
-    
-    # Calculate total emissions for each hour (only from normal-price grid)
-    df['emissions_g_co2_eq'] = df['grid_energy_normal_price_mwh'] * 1000 * country_emission_factor
-    
-    # Calculate total consumption in MJ for emission factor calculation
-    df['total_consumption_mj'] = df['electrolyser_consumption_mwh'] * 3600  # 1 MWh = 3600 MJ
-    
-    # Calculate emission factor for each hour
-    df['emission_factor_kwh'] = df.apply(
-        lambda row: calculate_emission_factor(
-            row['ppa_energy_mwh'],
-            row['grid_energy_low_price_mwh'],
-            row['grid_energy_normal_price_mwh'],
-            country_emission_factor,
-            row['electrolyser_consumption_mwh']
-        ),
-        axis=1
-    )
-    
-    # Convert to g CO₂eq/MJ
+
+    # Total CO₂eq emissions per hour [g CO₂eq]
+    # E_NRES [MWh] × 1 000 [kWh/MWh] × EF_grid [g/kWh] = g CO₂eq
+    df['total_emissions_g_co2eq'] = df['e_nres_mwh'] * 1000 * country_emission_factor
+
+    # Hourly emission factor [g CO₂eq/kWh]
+    # = E_NRES [MWh] × EF_grid [g/kWh] / E_H2 [MWh]   (MWh cancels → g/kWh)
+    df['emission_factor_kwh'] = (
+        df['e_nres_mwh'] * country_emission_factor
+        / df['electrolyser_consumption_mwh'].replace(0, np.nan)
+    ).fillna(0)
+
+    # Convert to g CO₂eq/MJ  (1 kWh = 3.6 MJ)
     df['emission_factor_mj'] = df['emission_factor_kwh'].apply(convert_emission_factor_kwh_to_mj)
-    
-    # Check emission compliance
+
+    # Hourly emission compliance check
     df['is_emission_compliant'] = df['emission_factor_kwh'].apply(is_emission_compliant)
-    
+
     # ============================================
-    # PART 2: RFNBO PERCENTAGE CALCULATION
+    # PART 2: RFNBO SHARE  (hourly building block)
     # ============================================
-    
-    # Determine renewable share for grid (from energy mix, not price rule)
-    if isinstance(renewable_share, float):
-        # constant for all hours
-        df['grid_renewable_share_mix'] = renewable_share
-    else:
-        # time-varying
-        df = df.merge(renewable_share, left_on='datetime', right_on='timestamp', how='left', suffixes=('', '_renewable'))
-        df['grid_renewable_share_mix'] = df['renewable_share'].fillna(
-            renewable_share['renewable_share'].mean() if not renewable_share.empty else 0
-        )
-    
-    # Calculate RFNBO-qualifying energy
-    # RFNBO = PPA energy + Low-price grid (100%) + Normal-price grid renewable part
-    df['rfnbo_from_ppa_mwh'] = df['ppa_energy_mwh']  # PPA is 100% RFNBO
-    df['rfnbo_from_grid_low_price_mwh'] = df['grid_energy_low_price_mwh']  # Low-price grid is 100% RFNBO
-    df['rfnbo_from_grid_normal_price_mwh'] = df['grid_energy_normal_price_mwh'] * df['grid_renewable_share_mix']  # Normal-price grid: only renewable part
-    df['rfnbo_energy_mwh'] = df['rfnbo_from_ppa_mwh'] + df['rfnbo_from_grid_low_price_mwh'] + df['rfnbo_from_grid_normal_price_mwh']
-    
-    # Calculate RFNBO fraction
-    df['rfnbo_fraction'] = df['rfnbo_energy_mwh'] / df['electrolyser_consumption_mwh']
-    df['rfnbo_fraction'] = df['rfnbo_fraction'].clip(upper=1.0)  # Cap at 100%
-    
-    # Check if 100% RFNBO (RFNBO energy ≥ consumption)
+
+    # α_gridRES – constant grid renewable mix share (regulation does not allow time-varying values)
+    df['grid_renewable_share_mix'] = float(renewable_share)
+
+    # E_gridRES = E_grid × α_gridRES
+    df['e_grid_res_mwh'] = df['grid_energy_mwh'] * df['grid_renewable_share_mix']
+
+    # E_RFNBO = E_H2              if DA price < 20 €/MWh   (all consumption qualifies)
+    #         = E_PPA + E_gridRES  otherwise
+    df['rfnbo_energy_mwh'] = np.where(
+        df['is_low_price'],
+        df['electrolyser_consumption_mwh'],
+        df['ppa_energy_mwh'] + df['e_grid_res_mwh']
+    )
+    # Cap at E_H2 (can't have more RFNBO energy than consumed)
+    df['rfnbo_energy_mwh'] = np.minimum(df['rfnbo_energy_mwh'], df['electrolyser_consumption_mwh'])
+
+    # Hourly RFNBO fraction = E_RFNBO / E_H2
+    df['rfnbo_fraction'] = (
+        df['rfnbo_energy_mwh']
+        / df['electrolyser_consumption_mwh'].replace(0, np.nan)
+    ).fillna(0).clip(upper=1.0)
+
+    # -----------------------------------------------------------------------
+    # Regulatory link: if GHG criterion is NOT met within the temporal
+    # correlation window, the hydrogen produced does not qualify as RFNBO.
+    #
+    # • Hourly correlation  → check is per-hour; zero RFNBO immediately here.
+    # • Monthly correlation → zeroing happens after monthly aggregation in
+    #   aggregate_to_monthly(); keep raw hourly values intact here.
+    # -----------------------------------------------------------------------
+    if temporal_correlation == 'hourly':
+        df['rfnbo_energy_mwh'] = np.where(df['is_emission_compliant'], df['rfnbo_energy_mwh'], 0.0)
+        df['rfnbo_fraction']   = np.where(df['is_emission_compliant'], df['rfnbo_fraction'],   0.0)
+
+    # Hourly 100 % RFNBO flag
     df['is_rfnbo_100pct'] = df['rfnbo_energy_mwh'] >= df['electrolyser_consumption_mwh']
-    
-    # Overall compliance: both emission AND RFNBO checks must pass
-    df['is_compliant'] = df['is_emission_compliant'] & (df['rfnbo_fraction'] >= 1.0)
-    
+
+    # Overall hourly compliance: emission AND RFNBO checks
+    df['is_compliant'] = df['is_emission_compliant'] & df['is_rfnbo_100pct']
+
+    # Breakdown columns for visualization
+    if temporal_correlation == 'hourly':
+        # Zero breakdown when GHG not met
+        df['rfnbo_from_ppa_mwh'] = np.where(df['is_emission_compliant'], df['ppa_energy_mwh'], 0.0)
+        df['rfnbo_from_grid_low_price_mwh'] = np.where(
+            df['is_emission_compliant'],
+            df['grid_energy_low_price_mwh'],
+            0.0
+        )
+        df['rfnbo_from_grid_normal_price_mwh'] = np.where(
+            df['is_emission_compliant'] & ~df['is_low_price'],
+            df['e_grid_res_mwh'],
+            0.0
+        )
+    else:
+        # Monthly: keep raw hourly values; zeroing happens in aggregate_to_monthly()
+        df['rfnbo_from_ppa_mwh'] = df['ppa_energy_mwh']
+        df['rfnbo_from_grid_low_price_mwh'] = df['grid_energy_low_price_mwh']
+        df['rfnbo_from_grid_normal_price_mwh'] = np.where(
+            df['is_low_price'], 0.0, df['e_grid_res_mwh']
+        )
+
     return df
 
 
-def aggregate_to_monthly(hourly_df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_to_monthly(hourly_df: pd.DataFrame, temporal_correlation: str = 'hourly') -> pd.DataFrame:
     """
-    Aggregate hourly RFNBO results to monthly summary.
-    
-    This function takes the detailed hourly calculation results and produces
-    a monthly summary with key metrics for the entire period.
-    
+    Aggregate hourly RFNBO results to a period summary.
+
+    Implements the correct sum-based formulas for GHG emission factor and
+    RFNBO share over the full period (monthly or any window):
+
+        EF_H2      = Σ(E_NRES) × EF_grid / Σ(E_H2)
+                   = Σ(total_emissions_g_co2eq) / (Σ(E_H2) × 1 000)
+        %H2_RFNBO  = 100 × Σ(E_RFNBO) / Σ(E_H2)
+
+    For **monthly** correlation the GHG check is applied at the period level:
+    if the period EF_H2 ≥ 28.2 g CO₂eq/MJ, the entire period does not qualify
+    as RFNBO and all RFNBO fields are set to zero.
+
+    For **hourly** correlation the per-hour GHG zeroing was already applied in
+    calculate_rfnbo_compliance(); this function just sums those zeroed values.
+
     Args:
-        hourly_df: DataFrame from calculate_rfnbo_compliance()
-    
+        hourly_df: DataFrame produced by calculate_rfnbo_compliance()
+        temporal_correlation: 'hourly' or 'monthly' (default 'hourly')
+
     Returns:
-        DataFrame with one row containing monthly summary:
-        - total_consumption_mwh: Total energy consumed
-        - ppa_energy_mwh: Total PPA energy
-        - grid_energy_mwh: Total grid energy
-        - grid_energy_low_price_mwh: Grid energy during low prices
-        - grid_energy_normal_price_mwh: Grid energy during normal prices
-        - avg_emission_factor_kwh: Average emission factor (g CO₂eq/kWh)
-        - avg_emission_factor_mj: Average emission factor (g CO₂eq/MJ)
-        - emission_compliant_hours: Hours meeting emission requirement
-        - rfnbo_energy_mwh: Total RFNBO energy
-        - non_rfnbo_energy_mwh: Total non-RFNBO energy
-        - rfnbo_fraction: Overall RFNBO fraction (0-1)
-        - rfnbo_100pct_hours: Hours with 100% RFNBO
-        - compliant_hours: Hours meeting both checks
-        - total_hours: Total number of hours
-    
+        Single-row DataFrame with period summary:
+        - total_consumption_mwh         : Σ E_H2 [MWh]
+        - ppa_energy_mwh                : Σ E_PPA [MWh]
+        - grid_energy_mwh               : Σ E_grid [MWh]
+        - grid_energy_low_price_mwh     : Σ E_DAPrices [MWh]
+        - grid_energy_normal_price_mwh  : Σ normal-price grid [MWh]
+        - e_total_res_mwh               : Σ E_totalRES [MWh]
+        - e_nres_mwh                    : Σ E_NRES [MWh]
+        - total_emissions_g_co2eq       : Σ CO₂eq emissions [g]
+        - emission_factor_kwh           : period EF_H2 [g CO₂eq/kWh]  (sum-based)
+        - emission_factor_mj            : period EF_H2 [g CO₂eq/MJ]   (sum-based)
+        - emission_compliant_hours      : hours with hourly EF < threshold
+        - rfnbo_energy_mwh              : Σ E_RFNBO [MWh]  (0 if monthly GHG fails)
+        - non_rfnbo_energy_mwh          : Σ(E_H2) − Σ(E_RFNBO) [MWh]
+        - rfnbo_fraction                : Σ(E_RFNBO) / Σ(E_H2)  (0 if monthly GHG fails)
+        - rfnbo_pct                     : %H2_RFNBO (0 if monthly GHG fails)
+        - rfnbo_100pct_hours            : hours with hourly rfnbo_fraction ≥ 1
+        - compliant_hours               : hours passing both checks
+        - total_hours                   : total number of hours
+        - emission_compliance_rate      : fraction of hours with hourly EF compliant
+        - rfnbo_compliance_rate         : fraction of hours with 100 % RFNBO
+        - overall_compliance_rate       : fraction of hours fully compliant
+        - period_emission_compliant     : period EF < 28.2 g CO₂eq/MJ
+        - period_rfnbo_compliant        : period RFNBO fraction ≥ 1.0
+
     Example:
         >>> results = calculate_rfnbo_compliance(...)
-        >>> summary = aggregate_to_monthly(results)
-        >>> print(f"Monthly RFNBO fraction: {summary['rfnbo_fraction'].values[0] * 100:.1f}%")
-        >>> print(f"Emission factor: {summary['avg_emission_factor_mj'].values[0]:.2f} g CO₂eq/MJ")
+        >>> summary = aggregate_to_monthly(results, temporal_correlation='monthly')
+        >>> print(f"Period RFNBO: {summary['rfnbo_pct'].values[0]:.1f}%")
+        >>> print(f"Emission factor: {summary['emission_factor_mj'].values[0]:.2f} g CO₂eq/MJ")
     """
     if hourly_df.empty:
         return pd.DataFrame()
-    
+
     hourly_df = hourly_df.copy()
-    
-    # Calculate monthly summary statistics
     total_consumption = hourly_df['electrolyser_consumption_mwh'].sum()
-    
+    total_rfnbo = hourly_df['rfnbo_energy_mwh'].sum()
+    total_hours = len(hourly_df)
+
+    # -----------------------------------------------------------------------
+    # Period GHG Emission Factor
+    # EF_H2 = Σ(total_emissions_g_co2eq) / (Σ(E_H2) × 1 000)
+    #       = Σ(E_NRES × EF_grid × 1000) / (Σ(E_H2) × 1000)
+    #       = Σ(E_NRES) × EF_grid / Σ(E_H2)     [g CO₂eq/kWh]
+    # -----------------------------------------------------------------------
+    total_emissions_g = hourly_df['total_emissions_g_co2eq'].sum()
+    period_ef_kwh = (
+        total_emissions_g / (total_consumption * 1000)
+        if total_consumption > 0 else 0.0
+    )
+    period_ef_mj = convert_emission_factor_kwh_to_mj(period_ef_kwh)
+    period_ghg_compliant = period_ef_mj < MAX_EMISSION_FACTOR_MJ
+
+    # -----------------------------------------------------------------------
+    # Period RFNBO share
+    # %H2_RFNBO = 100 × Σ(E_RFNBO) / Σ(E_H2)
+    #
+    # For monthly correlation: if the period GHG check fails, the entire
+    # period does not qualify as RFNBO → force RFNBO to 0.
+    # -----------------------------------------------------------------------
+    if temporal_correlation == 'monthly' and not period_ghg_compliant:
+        total_rfnbo = 0.0
+
+    period_rfnbo_fraction = total_rfnbo / total_consumption if total_consumption > 0 else 0.0
+
     monthly_summary = {
+        # Energy volumes
         'total_consumption_mwh': total_consumption,
         'ppa_energy_mwh': hourly_df['ppa_energy_mwh'].sum(),
         'grid_energy_mwh': hourly_df['grid_energy_mwh'].sum(),
         'grid_energy_low_price_mwh': hourly_df['grid_energy_low_price_mwh'].sum(),
         'grid_energy_normal_price_mwh': hourly_df['grid_energy_normal_price_mwh'].sum(),
-        'avg_emission_factor_kwh': hourly_df['emission_factor_kwh'].mean(),
-        'avg_emission_factor_mj': hourly_df['emission_factor_mj'].mean(),
-        'emission_compliant_hours': hourly_df['is_emission_compliant'].sum(),
-        'rfnbo_energy_mwh': hourly_df['rfnbo_energy_mwh'].sum(),
-        'non_rfnbo_energy_mwh': total_consumption - hourly_df['rfnbo_energy_mwh'].sum(),
-        'rfnbo_fraction': hourly_df['rfnbo_energy_mwh'].sum() / total_consumption if total_consumption > 0 else 0,
-        'rfnbo_100pct_hours': hourly_df['is_rfnbo_100pct'].sum(),
-        'compliant_hours': hourly_df['is_compliant'].sum(),
-        'total_hours': len(hourly_df),
-        'emission_compliance_rate': hourly_df['is_emission_compliant'].sum() / len(hourly_df),
-        'rfnbo_compliance_rate': hourly_df['is_rfnbo_100pct'].sum() / len(hourly_df),
-        'overall_compliance_rate': hourly_df['is_compliant'].sum() / len(hourly_df)
+        'e_total_res_mwh': hourly_df['e_total_res_mwh'].sum(),
+        'e_nres_mwh': hourly_df['e_nres_mwh'].sum(),
+        'total_emissions_g_co2eq': total_emissions_g,
+        # Period GHG emission factor (sum-based, not simple hourly average)
+        'emission_factor_kwh': period_ef_kwh,
+        'emission_factor_mj': period_ef_mj,
+        # Period RFNBO share (sum-based; 0 if monthly GHG fails)
+        'rfnbo_energy_mwh': total_rfnbo,
+        'non_rfnbo_energy_mwh': total_consumption - total_rfnbo,
+        'rfnbo_fraction': period_rfnbo_fraction,
+        'rfnbo_pct': period_rfnbo_fraction * 100,
+        # Hourly compliance counts
+        'emission_compliant_hours': int(hourly_df['is_emission_compliant'].sum()),
+        'rfnbo_100pct_hours': int(hourly_df['is_rfnbo_100pct'].sum()),
+        'compliant_hours': int(hourly_df['is_compliant'].sum()),
+        'total_hours': total_hours,
+        # Hourly compliance rates
+        'emission_compliance_rate': hourly_df['is_emission_compliant'].sum() / total_hours,
+        'rfnbo_compliance_rate': hourly_df['is_rfnbo_100pct'].sum() / total_hours,
+        'overall_compliance_rate': hourly_df['is_compliant'].sum() / total_hours,
+        # Period-level compliance flags
+        'period_emission_compliant': period_ghg_compliant,
+        'period_rfnbo_compliant': period_rfnbo_fraction >= 1.0,
     }
-    
+
     return pd.DataFrame([monthly_summary])
 
 
@@ -837,12 +938,13 @@ def is_rfnbo_compliant(monthly_summary: pd.DataFrame) -> dict:
             'rfnbo_fraction': 0.0
         }
     
-    emission_factor = monthly_summary['avg_emission_factor_mj'].values[0]
+    # Use sum-based period emission factor and RFNBO fraction from aggregate_to_monthly
+    emission_factor = monthly_summary['emission_factor_mj'].values[0]
     rfnbo_fraction = monthly_summary['rfnbo_fraction'].values[0]
-    
+
     emission_compliant = emission_factor < MAX_EMISSION_FACTOR_MJ
-    rfnbo_compliant = rfnbo_fraction >= 1.0  # 100% RFNBO
-    
+    rfnbo_compliant = rfnbo_fraction >= 1.0  # 100 % RFNBO
+
     return {
         'emission_compliant': emission_compliant,
         'rfnbo_compliant': rfnbo_compliant,

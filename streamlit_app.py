@@ -1,25 +1,13 @@
+import os
+from datetime import datetime, timedelta
+import logging
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-import logging
-
-# Import ENTSOE data fetching functions
-from fetch_entsoe import (
-    fetch_day_ahead_prices, 
-    fetch_day_ahead_prices_for_period,
-    fetch_generation_mix,
-    fetch_all_generation_types,
-    fetch_all_generation_types_for_period,
-    fetch_installed_capacity_all_types,
-    fetch_installed_capacity_for_period,
-    get_backend_country_name,
-    BIDDING_ZONES,
-    COUNTRY_TIMEZONES
-)
 
 # Import RFNBO calculation functions
 from rfnbo_calculations import (
@@ -54,111 +42,181 @@ st.set_page_config(
     layout="wide"
 )
 
-def fetch_month_data(country: str, year: int, month: int, fetch_capacity: bool = False):
+# Local ENTSO-E data directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_DATA_DIR = os.path.join(BASE_DIR, "entsoe_data")
+
+# Mapping from frontend country names to backend country names
+FRONTEND_TO_BACKEND_COUNTRIES = {
+    'Germany': 'Germany (DE/LU)',
+    'Italy': 'Italy Centro Nord',
+    'Denmark': 'Denmark 1',
+    'Sweden': 'Sweden 1',
+    'Norway': 'Norway 1',
+}
+
+def get_backend_country_name(frontend_country: str) -> str:
     """
-    Fetch all required data for a given month from ENTSOE.
-    Optimized to fetch entire month at once, with fallback to day-by-day if needed.
+    Convert frontend country name to backend country name.
+    """
+    return FRONTEND_TO_BACKEND_COUNTRIES.get(frontend_country, frontend_country)
+
+def get_available_datasets(data_dir: str = LOCAL_DATA_DIR) -> list:
+    """
+    List available datasets based on price files and matching generation/capacity files.
+    """
+    if not os.path.isdir(data_dir):
+        return []
+
+    datasets = []
+    for country in sorted(os.listdir(data_dir)):
+        country_dir = os.path.join(data_dir, country)
+        if not os.path.isdir(country_dir):
+            continue
+
+        price_files = [
+            name for name in os.listdir(country_dir)
+            if name.startswith(f"{country}_prices_") and name.endswith(".csv")
+        ]
+
+        for price_file in sorted(price_files):
+            suffix = price_file.replace(f"{country}_prices_", "").replace(".csv", "")
+            generation_file = f"{country}_generation_{suffix}.csv"
+            capacity_file = f"{country}_installed_capacity_{suffix}.csv"
+
+            generation_path = os.path.join(country_dir, generation_file)
+            if not os.path.isfile(generation_path):
+                continue
+
+            dataset = {
+                "label": f"{country} ({suffix})",
+                "country": country,
+                "prices_path": os.path.join(country_dir, price_file),
+                "generation_path": generation_path,
+                "capacity_path": os.path.join(country_dir, capacity_file),
+            }
+            datasets.append(dataset)
+
+    return datasets
+
+def _ensure_naive_datetime(series: pd.Series) -> pd.Series:
+    """
+    Parse a series into datetime and strip timezone info if present.
+    """
+    dt = pd.to_datetime(series, errors='coerce')
+    if hasattr(dt.dt, 'tz') and dt.dt.tz is not None:
+        dt = dt.dt.tz_localize(None)
+    return dt
+
+@st.cache_data(show_spinner=False)
+def _load_dataset_files(prices_path: str, generation_path: str, capacity_path: str) -> dict:
+    """
+    Load full price, generation, and installed capacity datasets for a selection.
+    """
+    prices_df = pd.read_csv(prices_path) if os.path.isfile(prices_path) else pd.DataFrame()
+    generation_df = pd.read_csv(generation_path) if os.path.isfile(generation_path) else pd.DataFrame()
+    capacity_df = pd.read_csv(capacity_path) if os.path.isfile(capacity_path) else pd.DataFrame()
+
+    if not prices_df.empty and 'datetime' in prices_df.columns:
+        prices_df['datetime'] = _ensure_naive_datetime(prices_df['datetime'])
+    if not generation_df.empty and 'timestamp' in generation_df.columns:
+        generation_df['timestamp'] = _ensure_naive_datetime(generation_df['timestamp'])
+    if not capacity_df.empty and 'timestamp' in capacity_df.columns:
+        capacity_df['timestamp'] = _ensure_naive_datetime(capacity_df['timestamp'])
+
+    return {
+        'prices': prices_df,
+        'generation': generation_df,
+        'installed_capacity': capacity_df
+    }
+
+def _filter_month(df: pd.DataFrame, time_col: str, start_date: datetime, end_exclusive: datetime) -> pd.DataFrame:
+    """
+    Filter a DataFrame to a month window [start_date, end_exclusive).
+    """
+    if df.empty or time_col not in df.columns:
+        return pd.DataFrame()
+    mask = (df[time_col] >= start_date) & (df[time_col] < end_exclusive)
+    return df.loc[mask].reset_index(drop=True)
+
+def _calculate_reference_year_share_from_generation(generation_df: pd.DataFrame, selected_year: int) -> tuple:
+    """
+    Calculate constant renewable share using generation data from two years before.
+    If unavailable, fall back to the selected year.
+    """
+    if generation_df.empty or 'timestamp' not in generation_df.columns:
+        return 0.30, selected_year
+
+    reference_year = selected_year - 2
+    ref_gen = generation_df[generation_df['timestamp'].dt.year == reference_year]
+    if ref_gen.empty:
+        reference_year = selected_year
+        ref_gen = generation_df[generation_df['timestamp'].dt.year == reference_year]
+
+    if ref_gen.empty:
+        return 0.30, reference_year
+
+    renewable_share = calculate_renewable_share(ref_gen)
+    return renewable_share, reference_year
+
+def _get_latest_year_month(prices_df: pd.DataFrame) -> tuple:
+    """
+    Derive the latest year and month from prices data.
+    """
+    if prices_df.empty or 'datetime' not in prices_df.columns:
+        return datetime.now().year, datetime.now().month
+    latest_dt = prices_df['datetime'].max()
+    return latest_dt.year, latest_dt.month
+
+def fetch_month_data(dataset: dict, year: int = None, month: int = None, fetch_capacity: bool = False):
+    """
+    Load all required data for a given month from local ENTSO-E datasets.
     
     Args:
-        country: Country name
-        year: Year
-        month: Month (1-12)
+        dataset: Dataset descriptor
+        year: Year (optional; defaults to latest in dataset)
+        month: Month (1-12, optional; defaults to latest in dataset)
         fetch_capacity: Whether to fetch installed capacity data
     
     Returns:
         dict with 'prices', 'generation', and optionally 'installed_capacity' DataFrames
     """
-    # Generate date range for the month
-    start_date = datetime(year, month, 1, 0, 0)
-    if month == 12:
-        end_date = datetime(year + 1, 1, 1, 0, 0) - timedelta(hours=1)
-    else:
-        end_date = datetime(year, month + 1, 1, 0, 0) - timedelta(hours=1)
-    
-    date_range = pd.date_range(start_date.date(), end_date.date(), freq='D')
-    
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
-    # Try optimized month-long fetch first
-    status_text.text("Attempting optimized month-long fetch...")
-    progress_bar.progress(0.1)
-    
-    try:
-        # Fetch prices for entire month at once
-        prices_df = fetch_day_ahead_prices_for_period(start_date, end_date, country)
-        if prices_df.empty:
-            raise ValueError("Month-long price fetch returned empty")
-        logger.info(f"✅ Successfully fetched {len(prices_df)} price records in one call")
-        use_optimized_prices = True
-    except Exception as e:
-        logger.warning(f"Month-long price fetch failed, falling back to day-by-day: {e}")
-        use_optimized_prices = False
-        prices_df = pd.DataFrame()
-    
-    progress_bar.progress(0.3)
-    
-    try:
-        # Fetch generation for entire month at once
-        status_text.text("Fetching generation data (20 types, rate-limited to avoid API errors)...")
-        generation_df = fetch_all_generation_types_for_period(start_date, end_date, country)
-        if generation_df.empty:
-            raise ValueError("Month-long generation fetch returned empty")
-        logger.info(f"✅ Successfully fetched {len(generation_df)} generation records in one call")
-        use_optimized_generation = True
-    except Exception as e:
-        logger.warning(f"Month-long generation fetch failed, falling back to day-by-day: {e}")
-        use_optimized_generation = False
-        generation_df = pd.DataFrame()
-    
+    status_text.text("Loading local ENTSO-E datasets...")
+    progress_bar.progress(0.2)
+
+    datasets = _load_dataset_files(
+        dataset.get("prices_path", ""),
+        dataset.get("generation_path", ""),
+        dataset.get("capacity_path", "")
+    )
+    if year is None or month is None:
+        year, month = _get_latest_year_month(datasets.get('prices', pd.DataFrame()))
+
+    # Generate date range for the month (end exclusive)
+    start_date = datetime(year, month, 1, 0, 0)
+    end_exclusive = datetime(year + 1, 1, 1, 0, 0) if month == 12 else datetime(year, month + 1, 1, 0, 0)
+
+    status_text.text("Filtering datasets to selected month...")
     progress_bar.progress(0.5)
-    
-    # Fallback to day-by-day if optimized fetch failed
-    if not use_optimized_prices or not use_optimized_generation:
-        status_text.text("Using day-by-day fallback for failed requests...")
-        all_prices = [] if use_optimized_prices else []
-        all_generation = [] if use_optimized_generation else []
-        
-        for idx, date in enumerate(date_range):
-            date_str = date.strftime('%Y-%m-%d')
-            status_text.text(f"Fetching data for {date_str}...")
-            
-            try:
-                if not use_optimized_prices:
-                    day_prices = fetch_day_ahead_prices(date_str, country)
-                    if not day_prices.empty:
-                        all_prices.append(day_prices)
-                
-                if not use_optimized_generation:
-                    day_gen = fetch_all_generation_types(date_str, country)
-                    if not day_gen.empty:
-                        all_generation.append(day_gen)
-            
-            except Exception as e:
-                logger.warning(f"Failed to fetch data for {date_str}: {e}")
-                st.warning(f"⚠️ Could not fetch complete data for {date_str}")
-            
-            progress_bar.progress(0.5 + 0.4 * (idx + 1) / len(date_range))
-        
-        # Combine fallback data with optimized data
-        if not use_optimized_prices and all_prices:
-            prices_df = pd.concat(all_prices, ignore_index=True)
-        if not use_optimized_generation and all_generation:
-            generation_df = pd.concat(all_generation, ignore_index=True)
-    
-    progress_bar.progress(0.9)
-    
-    # Fetch installed capacity (constant during month, so fetch once)
+
+    prices_df = _filter_month(datasets.get('prices', pd.DataFrame()), 'datetime', start_date, end_exclusive)
+    generation_df = _filter_month(datasets.get('generation', pd.DataFrame()), 'timestamp', start_date, end_exclusive)
+
     if fetch_capacity:
-        status_text.text("Fetching installed capacity data...")
-        try:
-            capacity_df = fetch_installed_capacity_for_period(start_date, end_date, country)
-        except Exception as e:
-            logger.warning(f"Failed to fetch installed capacity: {e}")
-            capacity_df = pd.DataFrame()
+        capacity_df = _filter_month(datasets.get('installed_capacity', pd.DataFrame()), 'timestamp', start_date, end_exclusive)
+        if capacity_df.empty:
+            # Fallback: use the latest available capacity before end_exclusive
+            full_capacity = datasets.get('installed_capacity', pd.DataFrame())
+            if not full_capacity.empty and 'timestamp' in full_capacity.columns:
+                fallback = full_capacity[full_capacity['timestamp'] < end_exclusive]
+                if not fallback.empty:
+                    latest_ts = fallback['timestamp'].max()
+                    capacity_df = fallback[fallback['timestamp'] == latest_ts].reset_index(drop=True)
     else:
         capacity_df = pd.DataFrame()
-    
+
     progress_bar.progress(1.0)
     progress_bar.empty()
     status_text.empty()
@@ -167,14 +225,14 @@ def fetch_month_data(country: str, year: int, month: int, fetch_capacity: bool =
     
     if not prices_df.empty:
         result['prices'] = prices_df
-        st.success(f"✅ Fetched {len(result['prices'])} price records")
+        st.success(f"✅ Loaded {len(result['prices'])} price records")
     else:
         result['prices'] = pd.DataFrame()
         st.error("❌ No price data available for this period")
     
     if not generation_df.empty:
         result['generation'] = generation_df
-        st.success(f"✅ Fetched {len(result['generation'])} generation records")
+        st.success(f"✅ Loaded {len(result['generation'])} generation records")
     else:
         result['generation'] = pd.DataFrame()
         st.warning("⚠️ No generation data available for this period")
@@ -182,18 +240,78 @@ def fetch_month_data(country: str, year: int, month: int, fetch_capacity: bool =
     if fetch_capacity:
         if not capacity_df.empty:
             result['installed_capacity'] = capacity_df
-            st.success(f"✅ Fetched {len(result['installed_capacity'])} installed capacity records")
+            st.success(f"✅ Loaded {len(result['installed_capacity'])} installed capacity records")
         else:
             result['installed_capacity'] = pd.DataFrame()
             st.warning("⚠️ No installed capacity data available (will use fallback method)")
     else:
         result['installed_capacity'] = pd.DataFrame()
     
+    result['year'] = year
+    result['month'] = month
     return result
 
-def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFrame):
+def fetch_full_data(dataset: dict, fetch_capacity: bool = False):
+    """
+    Load full datasets (prices, generation, installed capacity) for analysis.
+    """
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    status_text.text("Loading full local ENTSO-E datasets...")
+    progress_bar.progress(0.3)
+
+    datasets = _load_dataset_files(
+        dataset.get("prices_path", ""),
+        dataset.get("generation_path", ""),
+        dataset.get("capacity_path", "")
+    )
+    prices_df = datasets.get('prices', pd.DataFrame())
+    generation_df = datasets.get('generation', pd.DataFrame())
+    capacity_df = datasets.get('installed_capacity', pd.DataFrame()) if fetch_capacity else pd.DataFrame()
+
+    year, month = _get_latest_year_month(prices_df)
+
+    progress_bar.progress(1.0)
+    progress_bar.empty()
+    status_text.empty()
+
+    result = {}
+    if not prices_df.empty:
+        result['prices'] = prices_df
+        st.success(f"✅ Loaded {len(result['prices'])} price records")
+    else:
+        result['prices'] = pd.DataFrame()
+        st.error("❌ No price data available for this dataset")
+
+    if not generation_df.empty:
+        result['generation'] = generation_df
+        st.success(f"✅ Loaded {len(result['generation'])} generation records")
+    else:
+        result['generation'] = pd.DataFrame()
+        st.warning("⚠️ No generation data available for this dataset")
+
+    if fetch_capacity:
+        if not capacity_df.empty:
+            result['installed_capacity'] = capacity_df
+            st.success(f"✅ Loaded {len(result['installed_capacity'])} installed capacity records")
+        else:
+            result['installed_capacity'] = pd.DataFrame()
+            st.warning("⚠️ No installed capacity data available (will use fallback method)")
+    else:
+        result['installed_capacity'] = pd.DataFrame()
+
+    result['year'] = year
+    result['month'] = month
+    return result
+
+def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFrame, temporal_correlation: str = 'hourly'):
     """
     Create visualizations for RFNBO analysis.
+    
+    Args:
+        results_df: Hourly results DataFrame
+        monthly_summary: Monthly summary DataFrame
+        temporal_correlation: 'hourly' or 'monthly' - determines how to display compliance metrics
     """
     if results_df.empty:
         st.error("No data to visualize")
@@ -203,14 +321,14 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
     # COMMENTED OUT FOR NOW - capacity factor temporarily disabled
     if False and 'capacity_factor' in results_df.columns and results_df['capacity_factor'].std() > 0.01:
         st.subheader("☀️ PPA Capacity Factor and Production Profile")
-        st.caption("Actual capacity factor and adjusted PPA production from ENTSOE generation data")
+        st.caption("Actual capacity factor and adjusted PPA production from local ENTSO-E generation data")
         
         # Add explanation
         with st.expander("ℹ️ How is PPA production calculated?"):
             st.markdown("""
-            **Methodology** (using real ENTSOE data):
+            **Methodology** (using local ENTSO-E data):
             
-            1. **Fetch installed capacity** from ENTSOE (documentType A71)
+            1. **Load installed capacity** from local ENTSO-E data (documentType A71)
                - Example: Belgium Solar = 5,000 MW installed nationally
             
             2. **Fetch actual generation** timeseries (documentType A75)
@@ -331,379 +449,313 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
         with col4:
             st.metric("Max PPA Production", f"{results_df['ppa_production_mw'].max():.2f} MW")
     
-    # 1. Grid Renewable Share Over Time
-    st.subheader("🌿 Grid Renewable Share Over Time")
-    
-    # Get renewable share from session state
-    renewable_share = st.session_state.get('renewable_share', None)
-    renewable_share_mode = st.session_state.get('renewable_share_mode', 'constant')
-    
-    fig1 = go.Figure()
-    
-    if renewable_share is not None:
-        if isinstance(renewable_share, float):
-            # Constant renewable share - plot as horizontal line
-            fig1.add_trace(go.Scatter(
-                x=results_df['datetime'],
-                y=[renewable_share * 100] * len(results_df),
-                mode='lines',
-                name='Grid Renewable Share (Constant)',
-                line=dict(color='green', width=2)
-            ))
-            st.caption(f"**Mode**: Constant renewable share ({renewable_share * 100:.1f}%)")
-        else:
-            # Varying renewable share - plot time series
-            # Merge with results to align timestamps
-            renewable_df = renewable_share.copy()
-            renewable_df = renewable_df.rename(columns={'timestamp': 'datetime'})
-            plot_data = results_df[['datetime']].merge(renewable_df, on='datetime', how='left')
-            plot_data['renewable_share'] = plot_data['renewable_share'].fillna(plot_data['renewable_share'].mean())
-            
-            fig1.add_trace(go.Scatter(
-                x=plot_data['datetime'],
-                y=plot_data['renewable_share'] * 100,
-                mode='lines',
-                name='Grid Renewable Share (Varying)',
-                line=dict(color='green', width=2)
-            ))
-            
-            # Add mean line
-            mean_renewable = plot_data['renewable_share'].mean() * 100
-            fig1.add_hline(
-                y=mean_renewable,
-                line_dash="dash",
-                line_color="darkgreen",
-                annotation_text=f"Mean: {mean_renewable:.1f}%"
-            )
-            st.caption(f"**Mode**: Varying renewable share based on energy mix (avg: {mean_renewable:.1f}%)")
-    else:
-        # Fallback if renewable share not available
-        st.warning("Renewable share data not available")
-    
-    fig1.update_layout(
-        xaxis_title="Date & Time",
-        yaxis_title="Renewable Share (%)",
-        hovermode='x unified',
-        height=400,
-        yaxis=dict(range=[0, 100])
-    )
-    st.plotly_chart(fig1, use_container_width=True)
-    
-    # 2. Energy Sources Breakdown
-    st.subheader("⚡ Energy Sources")
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(
-        x=results_df['datetime'],
-        y=results_df['ppa_energy_mwh'],
-        mode='lines',
-        name='PPA (100% RFNBO)',
-        stackgroup='one',
-        line=dict(color='green')
-    ))
-    
-    # Calculate total grid RFNBO (low-price + normal-price renewable part)
-    results_df['grid_rfnbo_total'] = results_df['rfnbo_from_grid_low_price_mwh'] + results_df['rfnbo_from_grid_normal_price_mwh']
-    results_df['grid_non_rfnbo_total'] = results_df['grid_energy_mwh'] - results_df['grid_rfnbo_total']
-    
-    fig2.add_trace(go.Scatter(
-        x=results_df['datetime'],
-        y=results_df['grid_rfnbo_total'],
-        mode='lines',
-        name='Grid (RFNBO)',
-        stackgroup='one',
-        line=dict(color='lightgreen')
-    ))
-    fig2.add_trace(go.Scatter(
-        x=results_df['datetime'],
-        y=results_df['grid_non_rfnbo_total'],
-        mode='lines',
-        name='Grid (Non-RFNBO)',
-        stackgroup='one',
-        line=dict(color='orange')
-    ))
-    fig2.update_layout(
-        xaxis_title="Date & Time",
-        yaxis_title="Energy (MWh)",
-        hovermode='x unified',
-        height=400
-    )
-    st.plotly_chart(fig2, use_container_width=True)
-    
-    # 3. Energy & Emissions Breakdown
-    st.subheader("📋 Energy & Emissions Breakdown")
-    
-    st.markdown("""
-    This table shows how your electrolyser's energy consumption is sourced and the associated emissions.
-    - **For emission calculations**: Low-price grid (<20€/MWh) is treated as 0 emissions
-    - **For RFNBO matching**: Uses actual renewable share from energy mix (low-price rule does NOT apply)
-    """)
-    
-    # Create breakdown table
-    breakdown_data = {
-        'Energy Source': [],
-        'Energy (MWh)': [],
-        'Percentage (%)': [],
-        'Emission Factor (g CO₂eq/kWh)': [],
-        'Total Emissions (kg CO₂eq)': [],
-        'RFNBO Status': []
-    }
-    
+    # 1. Energy Sources Breakdown (lazy-rendered inside an expander to avoid lag)
+    with st.expander("⚡ Energy Sources (click to show detailed stacked area chart)", expanded=False):
+        st.caption("Stacked view of PPA, RFNBO grid share, and non-RFNBO grid energy over time.")
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=results_df['datetime'],
+            y=results_df['ppa_energy_mwh'],
+            mode='lines',
+            name='PPA (100% RFNBO)',
+            stackgroup='one',
+            line=dict(color='green')
+        ))
+        
+        # Calculate total grid RFNBO (low-price + normal-price renewable part)
+        results_df['grid_rfnbo_total'] = results_df['rfnbo_from_grid_low_price_mwh'] + results_df['rfnbo_from_grid_normal_price_mwh']
+        results_df['grid_non_rfnbo_total'] = results_df['grid_energy_mwh'] - results_df['grid_rfnbo_total']
+        
+        fig2.add_trace(go.Scatter(
+            x=results_df['datetime'],
+            y=results_df['grid_rfnbo_total'],
+            mode='lines',
+            name='Grid (RFNBO)',
+            stackgroup='one',
+            line=dict(color='lightgreen')
+        ))
+        fig2.add_trace(go.Scatter(
+            x=results_df['datetime'],
+            y=results_df['grid_non_rfnbo_total'],
+            mode='lines',
+            name='Grid (Non-RFNBO)',
+            stackgroup='one',
+            line=dict(color='orange')
+        ))
+        fig2.update_layout(
+            xaxis_title="Date & Time",
+            yaxis_title="Energy (MWh)",
+            hovermode='x unified',
+            height=400
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # 3. GHG Compliance & RFNBO Temporal Matching
+    st.subheader("📊 GHG Compliance & RFNBO Temporal Matching")
+
+    # --- Build monthly metrics from hourly data ---
+    _df = results_df.copy()
+    _df['_year']       = pd.to_datetime(_df['datetime']).dt.year
+    _df['_month']      = pd.to_datetime(_df['datetime']).dt.month
+    _df['_month_abbr'] = pd.to_datetime(_df['datetime']).dt.strftime('%b')
+
+    # Ensure resolution_minutes exists (default 60 min if absent)
+    if 'resolution_minutes' not in _df.columns:
+        _df['resolution_minutes'] = 60
+
+    if temporal_correlation == 'hourly':
+        # Time-weighted average per month:
+        #   value_month = Σ(value_h × Δt_h) / Σ(Δt_h)
+        # where Δt_h = resolution_minutes for each hourly interval.
+        _df['_ef_weighted']    = _df['emission_factor_mj'] * _df['resolution_minutes']
+        _df['_rfnbo_weighted'] = _df['rfnbo_fraction']     * _df['resolution_minutes']
+
+        monthly_metrics = _df.groupby(['_year', '_month', '_month_abbr']).agg(
+            _ef_weight_sum=('_ef_weighted',    'sum'),
+            _rfnbo_weight_sum=('_rfnbo_weighted', 'sum'),
+            _time_sum=('resolution_minutes',   'sum'),
+            electrolyser_consumption_mwh=('electrolyser_consumption_mwh', 'sum'),
+            ghg_compliant_intervals=('is_emission_compliant', 'sum'),
+            rfnbo_100pct_intervals=('is_rfnbo_100pct', 'sum'),
+            total_intervals=('electrolyser_consumption_mwh', 'count'),
+        ).reset_index()
+
+        monthly_metrics['emission_factor_mj'] = (
+            monthly_metrics['_ef_weight_sum'] / monthly_metrics['_time_sum']
+        ).fillna(0)
+        monthly_metrics['rfnbo_pct'] = (
+            monthly_metrics['_rfnbo_weight_sum'] / monthly_metrics['_time_sum'] * 100
+        ).fillna(0).clip(upper=100)
+
+    else:  # monthly correlation — sum-based (energy-weighted) formulas
+        monthly_metrics = _df.groupby(['_year', '_month', '_month_abbr']).agg(
+            electrolyser_consumption_mwh=('electrolyser_consumption_mwh', 'sum'),
+            total_emissions_g_co2eq=('total_emissions_g_co2eq', 'sum'),
+            rfnbo_energy_mwh=('rfnbo_energy_mwh', 'sum'),
+            ghg_compliant_intervals=('is_emission_compliant', 'sum'),
+            rfnbo_100pct_intervals=('is_rfnbo_100pct', 'sum'),
+            total_intervals=('electrolyser_consumption_mwh', 'count'),
+        ).reset_index()
+
+        # EF_H2 = Σ(E_NRES × EF_grid × 1000) / (Σ(E_H2) × 1000)
+        #       = Σ(total_emissions_g) / (Σ(E_H2) × 3600)   [g CO₂eq/MJ]
+        monthly_metrics['emission_factor_mj'] = (
+            monthly_metrics['total_emissions_g_co2eq']
+            / (monthly_metrics['electrolyser_consumption_mwh'] * 3600)
+        ).fillna(0)
+        # Monthly GHG compliance flag: if GHG fails for the month → RFNBO = 0%
+        monthly_metrics['_ghg_ok'] = monthly_metrics['emission_factor_mj'] < MAX_EMISSION_FACTOR_MJ
+        # %H2_RFNBO = 100 × Σ(E_RFNBO) / Σ(E_H2), zeroed when monthly GHG fails
+        monthly_metrics['rfnbo_pct'] = np.where(
+            monthly_metrics['_ghg_ok'],
+            (monthly_metrics['rfnbo_energy_mwh']
+             / monthly_metrics['electrolyser_consumption_mwh'] * 100
+            ).fillna(0).clip(upper=100),
+            0.0
+        )
+
+    monthly_metrics = monthly_metrics.sort_values(['_year', '_month']).reset_index(drop=True)
+    monthly_metrics['year_str'] = monthly_metrics['_year'].astype(str)
+
+    multi_year = monthly_metrics['_year'].nunique() > 1
+
+    # --- Overall KPI metrics ---
+    total_intervals   = len(results_df)
     total_consumption = results_df['electrolyser_consumption_mwh'].sum()
-    ppa_energy = results_df['ppa_energy_mwh'].sum()
-    grid_total = results_df['grid_energy_mwh'].sum()
-    grid_low_price = results_df['grid_energy_low_price_mwh'].sum()
-    grid_normal_price = results_df['grid_energy_normal_price_mwh'].sum()
-    
-    # Calculate renewable and non-renewable parts of grid (for RFNBO matching)
-    if 'grid_renewable_share_mix' in results_df.columns:
-        grid_renewable_part = (results_df['grid_energy_mwh'] * results_df['grid_renewable_share_mix']).sum()
-        grid_non_renewable_part = (results_df['grid_energy_mwh'] * (1 - results_df['grid_renewable_share_mix'])).sum()
-    else:
-        grid_renewable_part = 0
-        grid_non_renewable_part = grid_total
-    
-    # Get country emission factor
-    country = st.session_state.get('country', 'Belgium')
-    backend_country = get_backend_country_name(country)
-    grid_ef = get_grid_emission_factor(backend_country)
-    
-    # PPA Energy (0 emissions, 100% RFNBO)
-    breakdown_data['Energy Source'].append('1. PPA (Renewable Contract)')
-    breakdown_data['Energy (MWh)'].append(ppa_energy)
-    breakdown_data['Percentage (%)'].append(ppa_energy / total_consumption * 100 if total_consumption > 0 else 0)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append(0)
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(0)
-    breakdown_data['RFNBO Status'].append('✅ 100% RFNBO')
-    
-    # Grid - Low Price (< 20€/MWh)
-    # When prices < 20€/MWh: Considered 100% renewable (no subdivision)
-    # - 0 emissions for emission calculation
-    # - 100% RFNBO for RFNBO matching
-    breakdown_data['Energy Source'].append('2. Grid - Low Price (<20€/MWh)')
-    breakdown_data['Energy (MWh)'].append(grid_low_price)
-    breakdown_data['Percentage (%)'].append(grid_low_price / total_consumption * 100 if total_consumption > 0 else 0)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append(0)
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(0)
-    breakdown_data['RFNBO Status'].append('✅ 100% RFNBO (low price rule)')
-    
-    # Grid - Normal Price (≥ 20€/MWh)
-    # Split normal-price grid into renewable and non-renewable parts based on energy mix
-    if 'grid_renewable_share_mix' in results_df.columns:
-        grid_normal_price_renewable = (results_df['grid_energy_normal_price_mwh'] * results_df['grid_renewable_share_mix']).sum()
-        grid_normal_price_non_renewable = (results_df['grid_energy_normal_price_mwh'] * (1 - results_df['grid_renewable_share_mix'])).sum()
-    else:
-        grid_normal_price_renewable = 0
-        grid_normal_price_non_renewable = grid_normal_price
-    
-    # Grid - Normal Price - Renewable Part (from energy mix)
-    grid_normal_price_renewable_emissions = (grid_normal_price_renewable * grid_ef * 1000) / 1000  # kg
-    breakdown_data['Energy Source'].append('3a. Grid - Normal Price - Renewable Part (≥20€/MWh)')
-    breakdown_data['Energy (MWh)'].append(grid_normal_price_renewable)
-    breakdown_data['Percentage (%)'].append(grid_normal_price_renewable / total_consumption * 100 if total_consumption > 0 else 0)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append(grid_ef)
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(grid_normal_price_renewable_emissions)
-    breakdown_data['RFNBO Status'].append('✅ Counts as RFNBO (from energy mix), has emissions')
-    
-    # Grid - Normal Price - Non-Renewable Part (fossil)
-    grid_normal_price_non_renewable_emissions = (grid_normal_price_non_renewable * grid_ef * 1000) / 1000  # kg
-    breakdown_data['Energy Source'].append('3b. Grid - Normal Price - Non-Renewable Part (≥20€/MWh)')
-    breakdown_data['Energy (MWh)'].append(grid_normal_price_non_renewable)
-    breakdown_data['Percentage (%)'].append(grid_normal_price_non_renewable / total_consumption * 100 if total_consumption > 0 else 0)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append(grid_ef)
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(grid_normal_price_non_renewable_emissions)
-    breakdown_data['RFNBO Status'].append('❌ Not RFNBO, causes emissions')
-    
-    # Separator
-    breakdown_data['Energy Source'].append('─────────────')
-    breakdown_data['Energy (MWh)'].append(None)
-    breakdown_data['Percentage (%)'].append(None)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append(None)
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(None)
-    breakdown_data['RFNBO Status'].append('')
-    
-    # Total
-    total_emissions = results_df['emissions_g_co2_eq'].sum() / 1000
-    breakdown_data['Energy Source'].append('TOTAL CONSUMPTION')
-    breakdown_data['Energy (MWh)'].append(total_consumption)
-    breakdown_data['Percentage (%)'].append(100)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append('-')
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(total_emissions)
-    breakdown_data['RFNBO Status'].append('')
-    
-    # RFNBO breakdown (separate view)
-    breakdown_data['Energy Source'].append('─────────────')
-    breakdown_data['Energy (MWh)'].append(None)
-    breakdown_data['Percentage (%)'].append(None)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append(None)
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(None)
-    breakdown_data['RFNBO Status'].append('')
-    
-    breakdown_data['Energy Source'].append('RFNBO Analysis:')
-    breakdown_data['Energy (MWh)'].append(None)
-    breakdown_data['Percentage (%)'].append(None)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append(None)
-    breakdown_data['Total Emissions (kg CO₂eq)'].append(None)
-    breakdown_data['RFNBO Status'].append('')
-    
-    # Calculate Total RFNBO Energy
-    # RFNBO = PPA + Low-price grid (100%) + Normal-price grid renewable part
-    rfnbo_total = ppa_energy + grid_low_price + grid_normal_price_renewable
-    
-    breakdown_data['Energy Source'].append('→ Total RFNBO Energy')
-    breakdown_data['Energy (MWh)'].append(rfnbo_total)
-    breakdown_data['Percentage (%)'].append(rfnbo_total / total_consumption * 100 if total_consumption > 0 else 0)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append('-')
-    breakdown_data['Total Emissions (kg CO₂eq)'].append('-')
-    breakdown_data['RFNBO Status'].append('✅ = 1 + 2 + 3a')
-    
-    # Calculate Non-RFNBO Energy
-    non_rfnbo_total = grid_normal_price_non_renewable
-    
-    breakdown_data['Energy Source'].append('→ Non-RFNBO Energy')
-    breakdown_data['Energy (MWh)'].append(non_rfnbo_total)
-    breakdown_data['Percentage (%)'].append(non_rfnbo_total / total_consumption * 100 if total_consumption > 0 else 0)
-    breakdown_data['Emission Factor (g CO₂eq/kWh)'].append('-')
-    breakdown_data['Total Emissions (kg CO₂eq)'].append('-')
-    breakdown_data['RFNBO Status'].append('❌ = 3b only')
-    
-    breakdown_df = pd.DataFrame(breakdown_data)
-    
-    # Ensure Emission Factor column is string type to handle '-' values
-    breakdown_df['Emission Factor (g CO₂eq/kWh)'] = breakdown_df['Emission Factor (g CO₂eq/kWh)'].astype(str)
-    breakdown_df['Total Emissions (kg CO₂eq)'] = breakdown_df['Total Emissions (kg CO₂eq)'].astype(str)
-    
-    # Convert numeric columns back to numeric where appropriate (for sorting/filtering)
-    breakdown_df['Energy (MWh)'] = pd.to_numeric(breakdown_df['Energy (MWh)'], errors='coerce')
-    breakdown_df['Percentage (%)'] = pd.to_numeric(breakdown_df['Percentage (%)'], errors='coerce')
-    
-    # Display table with formatting
-    def format_breakdown(val):
-        """Format values, handling None/NaN"""
-        if pd.isna(val) or val is None:
-            return ''
-        if isinstance(val, (int, float)):
-            if abs(val) < 0.01 and val != 0:
-                return f'{val:.3f}'
-            return f'{val:.2f}'
-        return str(val)
-    
-    st.dataframe(
-        breakdown_df.style.format(format_breakdown, subset=['Energy (MWh)', 'Percentage (%)']),
-        width='stretch',  # Full width (replaced use_container_width)
-        hide_index=True
-    )
-    
-    # Emission Factor Comparison
-    st.subheader("🔬 Emission Factor Comparison vs Fossil Benchmark")
-    
-    total_emissions_g = results_df['emissions_g_co2_eq'].sum()
-    total_energy_mj = results_df['total_consumption_mj'].sum()
-    avg_ef_mj = total_emissions_g / total_energy_mj if total_energy_mj > 0 else 0
-    avg_ef_kwh = avg_ef_mj * 3.6
-    
-    fossil_comparator = FOSSIL_COMPARATOR_MJ
-    emission_limit = MAX_EMISSION_FACTOR_MJ
-    savings = ((fossil_comparator - avg_ef_mj) / fossil_comparator * 100) if fossil_comparator > 0 else 0
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric(
-            "Fossil Comparator",
-            f"{fossil_comparator:.1f} g CO₂eq/MJ",
-            help="Benchmark for fossil-based hydrogen production"
+    ghg_compliant_n   = int(results_df['is_emission_compliant'].sum())
+    rfnbo_100pct_n    = int(results_df['is_rfnbo_100pct'].sum())
+    weighted_rfnbo    = (results_df['rfnbo_energy_mwh'].sum() / total_consumption
+                         if total_consumption > 0 else 0)
+    period_ef_mj      = (results_df['total_emissions_g_co2eq'].sum() / (total_consumption * 3600)
+                         if total_consumption > 0 else 0)
+
+    if temporal_correlation == 'hourly':
+        ghg_rate   = ghg_compliant_n / total_intervals * 100 if total_intervals > 0 else 0
+        rfnbo_rate = rfnbo_100pct_n  / total_intervals * 100 if total_intervals > 0 else 0
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Intervals", f"{total_intervals:,}")
+        with col2:
+            st.metric(
+                "GHG Compliant Intervals",
+                f"{ghg_compliant_n:,} / {total_intervals:,}",
+                delta=f"{ghg_rate:.1f}%",
+                help="Hourly intervals where EF_H2 < 28.2 g CO₂eq/MJ"
+            )
+        with col3:
+            st.metric(
+                "RFNBO 100% Intervals",
+                f"{rfnbo_100pct_n:,} / {total_intervals:,}",
+                delta=f"{rfnbo_rate:.1f}%",
+                help="Hourly intervals where RFNBO fraction ≥ 100%"
+            )
+        with col4:
+            st.metric(
+                "Weighted Avg RFNBO %",
+                f"{weighted_rfnbo * 100:.1f}%",
+                delta="✅ Compliant" if weighted_rfnbo >= 1.0 else f"{weighted_rfnbo * 100 - 100:.1f}%",
+                delta_color="normal" if weighted_rfnbo >= 1.0 else "inverse",
+                help="Σ(E_RFNBO) / Σ(E_H2) across all hourly intervals"
+            )
+    else:  # monthly correlation
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Consumption", f"{total_consumption:,.0f} MWh")
+        with col2:
+            st.metric(
+                "Period GHG EF",
+                f"{period_ef_mj:.2f} g CO₂eq/MJ",
+                delta="✅ Compliant" if period_ef_mj < MAX_EMISSION_FACTOR_MJ else "❌ Non-compliant",
+                delta_color="normal" if period_ef_mj < MAX_EMISSION_FACTOR_MJ else "inverse",
+                help=f"Σ(E_NRES × EF_grid) / Σ(E_H2) — limit: {MAX_EMISSION_FACTOR_MJ:.1f} g CO₂eq/MJ"
+            )
+        with col3:
+            st.metric(
+                "Period RFNBO %",
+                f"{weighted_rfnbo * 100:.1f}%",
+                delta="✅ Compliant" if weighted_rfnbo >= 1.0 else f"{weighted_rfnbo * 100 - 100:.1f}% vs 100%",
+                delta_color="normal" if weighted_rfnbo >= 1.0 else "inverse",
+                help="Σ(E_RFNBO) / Σ(E_H2) over the full period"
+            )
+
+    st.markdown("---")
+
+    # --- Bar charts: GHG EF and RFNBO % by month (grouped by year if multi-year) ---
+    value_label = "Time-weighted avg" if temporal_correlation == 'hourly' else "Actual monthly value"
+    month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown(f"**GHG Emission Factor by Month** — {value_label}")
+        fig_ghg = go.Figure()
+        if multi_year:
+            for yr in sorted(monthly_metrics['_year'].unique()):
+                d = monthly_metrics[monthly_metrics['_year'] == yr]
+                fig_ghg.add_trace(go.Bar(
+                    x=d['_month_abbr'], y=d['emission_factor_mj'], name=str(yr)
+                ))
+        else:
+            fig_ghg.add_trace(go.Bar(
+                x=monthly_metrics['_month_abbr'],
+                y=monthly_metrics['emission_factor_mj'],
+                name='EF (g CO₂eq/MJ)',
+                marker_color='steelblue'
+            ))
+        fig_ghg.add_hline(
+            y=MAX_EMISSION_FACTOR_MJ, line_dash='dash', line_color='red',
+            annotation_text=f'Limit {MAX_EMISSION_FACTOR_MJ:.1f} g CO₂eq/MJ',
+            annotation_position='top left'
         )
-    
-    with col2:
-        st.metric(
-            "RFNBO Limit (30%)",
-            f"{emission_limit:.1f} g CO₂eq/MJ",
-            help="Maximum allowed emission factor for RFNBO compliance"
+        fig_ghg.update_layout(
+            xaxis=dict(title='Month', categoryorder='array', categoryarray=month_order),
+            yaxis_title='EF (g CO₂eq/MJ)',
+            barmode='group',
+            legend_title='Year' if multi_year else '',
+            height=350,
+            margin=dict(t=30)
         )
-    
-    with col3:
-        st.metric(
-            "Your Emission Factor",
-            f"{avg_ef_mj:.1f} g CO₂eq/MJ",
-            delta=f"{savings:.1f}% savings",
-            delta_color="normal" if savings >= 70 else "inverse",
-            help="Weighted average emission factor of your electrolyser"
+        st.plotly_chart(fig_ghg, use_container_width=True)
+
+    with col_right:
+        st.markdown(f"**RFNBO % by Month** — {value_label}")
+        fig_rfnbo = go.Figure()
+        if multi_year:
+            for yr in sorted(monthly_metrics['_year'].unique()):
+                d = monthly_metrics[monthly_metrics['_year'] == yr]
+                fig_rfnbo.add_trace(go.Bar(
+                    x=d['_month_abbr'], y=d['rfnbo_pct'], name=str(yr)
+                ))
+        else:
+            fig_rfnbo.add_trace(go.Bar(
+                x=monthly_metrics['_month_abbr'],
+                y=monthly_metrics['rfnbo_pct'],
+                name='RFNBO %',
+                marker_color='mediumseagreen'
+            ))
+        fig_rfnbo.add_hline(
+            y=100, line_dash='dash', line_color='red',
+            annotation_text='Target 100%',
+            annotation_position='top left'
         )
-    
-    # Detailed comparison table
-    comparison_data = {
-        'Metric': [
-            'Fossil Comparator (Benchmark)',
-            'RFNBO Emission Limit (30% of fossil)',
-            'Your Electrolyser Emission Factor',
-            'Difference vs Limit',
-            'GHG Savings vs Fossil',
-            'Emission Compliance Status'
-        ],
-        'Value (g CO₂eq/MJ)': [
-            f'{fossil_comparator:.2f}',
-            f'{emission_limit:.2f}',
-            f'{avg_ef_mj:.2f}',
-            f'{avg_ef_mj - emission_limit:+.2f}' + (' ✅' if avg_ef_mj <= emission_limit else ' ❌'),
-            f'{savings:.1f}%' + (' ✅ ≥70%' if savings >= 70 else ' ⚠️ <70%'),
-            '✅ COMPLIANT' if avg_ef_mj <= emission_limit else '❌ NON-COMPLIANT'
-        ],
-        'Value (g CO₂eq/kWh)': [
-            f'{fossil_comparator * 3.6:.2f}',
-            f'{emission_limit * 3.6:.2f}',
-            f'{avg_ef_kwh:.2f}',
-            f'{(avg_ef_mj - emission_limit) * 3.6:+.2f}',
-            '-',
-            '-'
-        ]
-    }
-    
-    comparison_df = pd.DataFrame(comparison_data)
-    st.dataframe(comparison_df, width='stretch', hide_index=True)  # Full width (replaced use_container_width)
-    
-    st.caption("""
-    **Key Insights:**
-    - Emission factor must be **< 28.2 g CO₂eq/MJ** for compliance
-    - This represents **70% GHG savings** vs fossil-based hydrogen
-    - Lower emission factor = More renewable energy used
-    """)
+        fig_rfnbo.update_layout(
+            xaxis=dict(title='Month', categoryorder='array', categoryarray=month_order),
+            yaxis_title='RFNBO %',
+            barmode='group',
+            legend_title='Year' if multi_year else '',
+            height=350,
+            margin=dict(t=30)
+        )
+        st.plotly_chart(fig_rfnbo, use_container_width=True)
     
     # 4. Monthly Summary Statistics
     if not monthly_summary.empty:
-        st.subheader("📈 Monthly Summary")
-        
+        st.subheader("📈 Period Summary")
+
+        s = monthly_summary.iloc[0]
+        ef_mj      = s['emission_factor_mj']
+        rfnbo_pct  = s['rfnbo_fraction'] * 100
+        comp_rate  = s['overall_compliance_rate'] * 100
+
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
-            st.metric(
-                "Total Consumption",
-                f"{monthly_summary['total_consumption_mwh'].values[0]:.0f} MWh"
-            )
-        
+            st.metric("Total Consumption", f"{s['total_consumption_mwh']:,.0f} MWh")
+
         with col2:
-            emission_factor = monthly_summary['avg_emission_factor_mj'].values[0]
             st.metric(
-                "Avg Emission Factor",
-                f"{emission_factor:.1f} g CO₂eq/MJ",
-                delta=f"{emission_factor - MAX_EMISSION_FACTOR_MJ:.1f} vs {MAX_EMISSION_FACTOR_MJ:.1f} limit",
-                delta_color="inverse"
+                "Period GHG EF",
+                f"{ef_mj:.2f} g CO₂eq/MJ",
+                delta="✅ Compliant" if ef_mj < MAX_EMISSION_FACTOR_MJ else f"❌ +{ef_mj - MAX_EMISSION_FACTOR_MJ:.2f} over limit",
+                delta_color="normal" if ef_mj < MAX_EMISSION_FACTOR_MJ else "inverse",
+                help=f"Sum-based: Σ(E_NRES × EF_grid) / Σ(E_H2) — limit: {MAX_EMISSION_FACTOR_MJ:.1f} g CO₂eq/MJ"
             )
-        
+
         with col3:
-            rfnbo_pct = monthly_summary['rfnbo_fraction'].values[0] * 100
             st.metric(
-                "RFNBO Fraction",
+                "Period RFNBO %",
                 f"{rfnbo_pct:.1f}%",
-                delta=f"{rfnbo_pct - 100:.1f}% vs 100% target"
+                delta="✅ Compliant" if rfnbo_pct >= 100 else f"{rfnbo_pct - 100:.1f}% vs 100% target",
+                delta_color="normal" if rfnbo_pct >= 100 else "inverse",
+                help="Sum-based: Σ(E_RFNBO) / Σ(E_H2) over the full period"
             )
-        
+
         with col4:
-            compliance_pct = monthly_summary['overall_compliance_rate'].values[0] * 100
             st.metric(
-                "Compliant Hours",
-                f"{compliance_pct:.1f}%",
-                delta=f"{monthly_summary['compliant_hours'].values[0]:.0f}/{monthly_summary['total_hours'].values[0]:.0f} hours"
+                "Compliant Intervals",
+                f"{comp_rate:.1f}%",
+                delta=f"{int(s['compliant_hours'])}/{int(s['total_hours'])} intervals",
+                help="Intervals meeting both GHG and RFNBO requirements"
             )
+
+def _summarize_results_by_period(results_df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """
+    Summarize RFNBO results by year or month for comparison charts.
+    """
+    if results_df.empty or 'datetime' not in results_df.columns:
+        return pd.DataFrame()
+
+    df = results_df.copy()
+    df['year'] = df['datetime'].dt.year
+    df['month'] = df['datetime'].dt.month
+
+    if period == 'year':
+        group_cols = ['year']
+    else:
+        group_cols = ['month']
+
+    summary = df.groupby(group_cols).agg(
+        total_consumption_mwh=('electrolyser_consumption_mwh', 'sum'),
+        rfnbo_energy_mwh=('rfnbo_energy_mwh', 'sum'),
+        avg_emission_factor_mj=('emission_factor_mj', 'mean'),
+        overall_compliance_rate=('is_compliant', 'mean')
+    ).reset_index()
+
+    summary['rfnbo_fraction'] = summary['rfnbo_energy_mwh'] / summary['total_consumption_mwh']
+    return summary
 
 def highlight_low_prices(row):
     """
@@ -716,11 +768,11 @@ def highlight_low_prices(row):
 
 def display_data_explorer_tab():
     """
-    Display the ENTSOE Data Explorer tab.
+    Display the ENTSO-E Data Explorer tab.
     """
-    st.header("📊 ENTSOE Data Explorer")
+    st.header("📊 ENTSO-E Trends Explorer")
     st.markdown("""
-    View raw data fetched from ENTSOE. Rows with prices **below 20€/MWh** are highlighted in **orange**.
+    View raw data loaded from local ENTSO-E datasets. Rows with prices **below 20€/MWh** are highlighted in **orange**.
     """)
     
     # Check if data exists in session state
@@ -1245,7 +1297,7 @@ def run_sensitivity_analysis(data, country, temporal_correlation, ratios):
     if data['generation'].empty:
         renewable_share = 0.30
     else:
-        renewable_share = calculate_renewable_share(data['generation'], 'constant')
+        renewable_share = calculate_renewable_share(data['generation'])
     
     # Technologies to analyze
     technologies = {
@@ -1748,7 +1800,7 @@ def run_solar_wind_split_analysis(data, country, temporal_correlation, combined_
     if data['generation'].empty:
         renewable_share = 0.30
     else:
-        renewable_share = calculate_renewable_share(data['generation'], 'constant')
+        renewable_share = calculate_renewable_share(data['generation'])
     
     results = {}
     
@@ -1823,15 +1875,23 @@ def main():
     # Sidebar configuration
     st.sidebar.header("⚙️ Configuration")
     
-    # Country selection
-    country_options = list(set([k for k in BIDDING_ZONES.keys() if not any(x in k for x in ['Germany 50', 'Germany Amprion', 'Germany TenneT', 'Germany TransnetBW'])]))
-    country_options.sort()
-    country = st.sidebar.selectbox("Country", country_options, index=country_options.index('Belgium') if 'Belgium' in country_options else 0)
+    # Dataset selection (local datasets)
+    dataset_options = get_available_datasets()
+    if not dataset_options:
+        st.sidebar.error("No local ENTSO-E datasets found in entsoe_data.")
+        return
+    dataset_labels = [dataset["label"] for dataset in dataset_options]
+    selected_label = st.sidebar.selectbox(
+        "Dataset",
+        dataset_labels,
+        index=0
+    )
+    dataset = next(d for d in dataset_options if d["label"] == selected_label)
+    country = dataset["country"]
     
-    # Time period
-    st.sidebar.subheader("📅 Time Period")
-    year = st.sidebar.number_input("Year", min_value=2015, max_value=2024, value=2023)
-    month = st.sidebar.selectbox("Month", range(1, 13), format_func=lambda x: datetime(2000, x, 1).strftime('%B'))
+    # Comparison mode
+    st.sidebar.subheader("📈 Comparison")
+    comparison_mode = st.sidebar.selectbox("Comparison View", ["Month comparison", "Year comparison"])
     
     # Electrolyser configuration
     st.sidebar.subheader("🔋 Electrolyser Configuration")
@@ -1865,15 +1925,7 @@ def main():
         solar_fraction = None
         wind_fraction = None
     
-    st.sidebar.caption("Will use actual generation data from ENTSOE for this technology")
-    
-    # Renewable Share Configuration
-    st.sidebar.subheader("🌿 Renewable Share Configuration")
-    renewable_share_mode = st.sidebar.radio(
-        "Renewable Share Calculation",
-        ['constant', 'varying'],
-        help="Constant: Uses monthly average renewable share. Varying: Uses hourly renewable share from energy mix."
-    )
+    st.sidebar.caption("Will use actual generation data from local ENTSO-E datasets")
     
     # Temporal correlation
     st.sidebar.subheader("⏱️ Temporal Correlation")
@@ -1881,41 +1933,40 @@ def main():
     
     # Fetch data button
     if st.sidebar.button("🚀 Fetch Data & Calculate", type="primary"):
-        st.info("⏱️ **Please wait**: Fetching month-long data with rate limiting to avoid API errors. This takes ~15-20 seconds.")
-        with st.spinner("Fetching data from ENTSOE..."):
+        st.info("⏱️ **Please wait**: Loading full local datasets. This may take a few seconds.")
+        with st.spinner("Loading data from local ENTSO-E datasets..."):
             # Always fetch installed capacity (useful for plots, and only fetched once on first day)
             fetch_capacity = True  # Always fetch for visualization purposes
-            data = fetch_month_data(country, year, month, fetch_capacity=fetch_capacity)
+            data = fetch_full_data(dataset, fetch_capacity=fetch_capacity)
         
         # Store data in session state for access from both tabs
         st.session_state['fetched_data'] = data
         st.session_state['country'] = country
-        st.session_state['year'] = year
-        st.session_state['month'] = month
+        st.session_state['dataset_label'] = dataset["label"]
+        st.session_state['year'] = data.get('year')
+        st.session_state['month'] = data.get('month')
+        st.session_state['comparison_mode'] = comparison_mode
         st.session_state['ppa_capacity_mw'] = ppa_capacity_mw
         st.session_state['ppa_technology'] = ppa_technology
         st.session_state['solar_fraction'] = solar_fraction if '+' in ppa_technology else None
         st.session_state['wind_fraction'] = wind_fraction if '+' in ppa_technology else None
-        st.session_state['renewable_share_mode'] = renewable_share_mode
-        
         if data['prices'].empty:
             st.error("❌ Unable to proceed without price data")
             return
         
-        # Calculate renewable share from ENTSOE based on user selection
-        if data['generation'].empty:
-            st.warning("⚠️ No generation data available, using default 30% renewable share")
-            renewable_share = 0.30
-        else:
-            # Use 'constant' for monthly average, 'varying' for hourly
-            renewable_share = calculate_renewable_share(data['generation'], renewable_share_mode)
-            if isinstance(renewable_share, float):
-                st.info(f"ℹ️ Calculated constant renewable share: {renewable_share * 100:.1f}%")
-            else:
-                avg_renewable = renewable_share['renewable_share'].mean()
-                st.info(f"ℹ️ Calculated varying renewable share (avg: {avg_renewable * 100:.1f}%)")
+        # Calculate constant renewable share based on data from two years prior
+        full_datasets = _load_dataset_files(
+            dataset.get("prices_path", ""),
+            dataset.get("generation_path", ""),
+            dataset.get("capacity_path", "")
+        )
+        renewable_share, reference_year = _calculate_reference_year_share_from_generation(
+            full_datasets.get("generation", pd.DataFrame()),
+            data.get('year')
+        )
+        st.info(f"ℹ️ Using constant renewable share from {reference_year}: {renewable_share * 100:.1f}%")
         
-        # Store renewable share in session state for plotting
+        # Store renewable share in session state for calculations
         st.session_state['renewable_share'] = renewable_share
         
         # Calculate RFNBO compliance
@@ -1954,11 +2005,9 @@ def main():
             st.error("❌ Unable to calculate RFNBO compliance")
             return
         
-        # Aggregate to monthly if needed
-        if temporal_correlation == 'monthly':
-            monthly_summary = aggregate_to_monthly(results)
-        else:
-            monthly_summary = aggregate_to_monthly(results)
+        # Aggregate to period summary (pass temporal_correlation so monthly GHG
+        # zeroing of RFNBO is applied correctly when using monthly mode)
+        monthly_summary = aggregate_to_monthly(results, temporal_correlation=temporal_correlation)
         
         # Store results in session state
         st.session_state['results'] = results
@@ -1966,7 +2015,7 @@ def main():
         st.session_state['renewable_share'] = renewable_share
     
     # Create tabs for different views
-    tab1, tab2, tab3 = st.tabs(["🎯 RFNBO Analysis", "📊 ENTSOE Data Explorer", "📈 Sensitivity Analysis"])
+    tab1, tab2, tab3 = st.tabs(["🎯 RFNBO Trends", "📊 ENTSO-E Trends Explorer", "📈 Sensitivity & Scenarios"])
     
     with tab1:
         # RFNBO Analysis Tab
@@ -1975,7 +2024,7 @@ def main():
             monthly_summary = st.session_state['monthly_summary']
             
             # Display results
-            st.header("📊 RFNBO Compliance Results")
+            st.header("📊 RFNBO Trends & Compliance")
             
             # Get compliance status
             compliance = is_rfnbo_compliant(monthly_summary)
@@ -2002,8 +2051,8 @@ def main():
                     st.warning(f"⚠️ RFNBO Matching: {rfnbo_pct:.1f}% < 100%")
             
             # Visualizations
-            create_visualizations(results, monthly_summary)
-            
+            create_visualizations(results, monthly_summary, temporal_correlation)
+
             # Detailed hourly breakdown
             st.subheader("📊 Hourly Energy & Emissions Breakdown")
             
@@ -2025,7 +2074,7 @@ def main():
                     hourly_breakdown['grid_non_renewable_energy_mwh'] = results['grid_energy_mwh']
                 
                 # Add emissions and compliance
-                hourly_breakdown['emissions_g_co2_eq'] = results['emissions_g_co2_eq']
+                hourly_breakdown['total_emissions_g_co2eq'] = results['total_emissions_g_co2eq']
                 hourly_breakdown['emission_factor_mj'] = results['emission_factor_mj']
                 hourly_breakdown['emission_compliant'] = results['is_emission_compliant']
                 hourly_breakdown['rfnbo_fraction'] = results['rfnbo_fraction']
@@ -2043,7 +2092,7 @@ def main():
                     'grid_energy_normal_price_mwh': 'Grid Normal-Price ≥20€ (MWh)',
                     'grid_renewable_energy_mwh': 'Grid Renewable Part (MWh)',
                     'grid_non_renewable_energy_mwh': 'Grid Non-Renewable (MWh)',
-                    'emissions_g_co2_eq': 'Emissions (g CO₂eq)',
+                    'total_emissions_g_co2eq': 'Emissions (g CO₂eq)',
                     'emission_factor_mj': 'EF (g CO₂eq/MJ)',
                     'emission_compliant': 'Emission ✓',
                     'rfnbo_fraction': 'RFNBO %',
@@ -2134,7 +2183,7 @@ def main():
         
         **RFNBO energy calculation:**
         - RFNBO = PPA energy + (Grid energy × renewable share from energy mix)
-        - Renewable share is calculated from ENTSOE generation mix data (monthly average)
+        - Renewable share is calculated from local ENTSO-E generation mix data (constant, from two years prior when available)
         - Temporal correlation: hourly or monthly matching
         
         ### Grid Energy Rules (Applied Automatically)
@@ -2144,14 +2193,14 @@ def main():
            - This rule is always applied
            
         2. **Renewable mix** (RFNBO matching):
-           - Based on actual renewable share in national energy mix from ENTSOE data
+           - Based on actual renewable share in national energy mix from local ENTSO-E data
            - Calculated as monthly average from actual generation data
         
         ### Data Sources
         
-        - Day-ahead electricity prices from ENTSOE
-        - Generation mix data (renewable vs non-renewable) from ENTSOE
-        - Installed capacity per production type from ENTSOE
+        - Day-ahead electricity prices from local ENTSO-E datasets
+        - Generation mix data (renewable vs non-renewable) from local ENTSO-E datasets
+        - Installed capacity per production type from local ENTSO-E datasets
         - Country-specific grid emission factors
         """)
 
