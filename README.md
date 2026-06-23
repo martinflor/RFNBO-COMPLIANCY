@@ -94,6 +94,48 @@ streamlit run streamlit_app.py
 
 The application will open in your default web browser at `http://localhost:8501`
 
+### Standalone Ratio Sweep
+
+Run the non-Streamlit ratio sweep to compare the five approved technologies across PPA-to-electrolyser ratios and export a CSV-only interval summary:
+
+```bash
+python rfnbo_ratio_sweep_cli.py --country Belgium --electrolyser-mw 50 --ratios 0.75 1.0 1.25
+```
+
+The output CSV contains one row per interval, technology, and ratio with the overall RFNBO percentage.
+
+### Solar Ratio Sweep
+
+Run the solar-share sweep to see how the solar fraction inside a combined PPA changes RFNBO compliance for both offshore and onshore wind combinations. This command generates four graphs by default: hourly and monthly results for offshore wind and for onshore wind.
+
+```bash
+python rfnbo_solar_ratio_sweep_cli.py --country Belgium --electrolyser-mw 50 --start 2023-01-01 --end 2023-01-31
+```
+
+You can override the default PPA ratios with `--ppa-ratios` and the solar-share resolution with `--solar-ratios`.
+
+### PPA Sourcing Cost Sweep
+
+Run the PPA sourcing cost sweep to estimate a contract price that follows the day-ahead market plus an extra margin. The script sweeps both the production-to-consumption ratio and the extra margin, then reports total cost and RFNBO percentage. The margin is only charged on PPA energy that is actually produced; residual grid energy stays at DAM.
+
+```bash
+python PPA_sourcing_cost.py --country Belgium --electrolyser-mw 50 --ratios 0.5 0.75 1.0 1.25 --margins 1 2 3 4 5
+```
+
+The default run compares Solar, Wind Offshore, Wind Onshore, and the two 50/50 combined cases. The script writes one HTML plot per technology so the curves stay readable: color = extra margin, bubble size = RFNBO percentage. If you want only a subset, pass `--technologies` with one or more values.
+
+For annual numbers, pass an explicit `--start` and `--end` window such as `--start 2025-01-01 --end 2025-12-31`. Otherwise the script uses the full loaded dataset.
+
+### Capacity-Factor-Aware PPA Sourcing Cost Sweep
+
+Use the CF-aware variant when you want the ratio to represent energy rather than installed capacity. It sizes each PPA from the relevant capacity factor before calculating the DAM + margin cost and produces the same aggregated all-technologies plot.
+
+```bash
+python PPA_sourcing_cost_capacity_factor.py --country Belgium --electrolyser-mw 50 --ratios 0.5 0.75 1.0 1.25 --margins 1 2 3 4 5
+```
+
+The default run uses data-derived capacity factors from the loaded ENTSOE generation and installed-capacity series, with a fallback to the built-in defaults if needed.
+
 ### Configuration Steps
 
 1. **Select Country**: Choose the electricity bidding zone

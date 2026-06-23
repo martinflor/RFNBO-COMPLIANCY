@@ -41,7 +41,7 @@ def run_collection(country: str, start_date: str, end_date: str,
         True if successful, False otherwise
     """
     cmd = [
-        'python', 'collect_entsoe_data.py',
+        sys.executable, 'collect_entsoe_data.py',
         '--country', country,
         '--start', start_date,
         '--end', end_date,
