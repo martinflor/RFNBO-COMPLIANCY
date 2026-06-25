@@ -15,8 +15,6 @@ from rfnbo_calculations import (
     calculate_rfnbo_compliance,
     aggregate_to_monthly,
     is_rfnbo_compliant,
-    calculate_statistics,
-    calculate_generation_statistics,
     get_grid_emission_factor,
     calculate_ppa_production_from_generation_data,
     PSR_TYPE_MAPPING,
@@ -26,6 +24,8 @@ from rfnbo_calculations import (
     PRICE_THRESHOLD_EUR_MWH,
     FOSSIL_COMPARATOR_MJ
 )
+
+from data_explorer import calculate_statistics, calculate_generation_statistics
 
 # Set up logging
 # Set to WARNING to reduce console noise, INFO for detailed debugging
@@ -504,6 +504,26 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
     if 'resolution_minutes' not in _df.columns:
         _df['resolution_minutes'] = 60
 
+    ppa_energy_columns = [
+        column_name for column_name in [
+            'ppa_energy_mwh',
+            'solar_energy_mwh',
+            'wind_onshore_energy_mwh',
+            'wind_offshore_energy_mwh',
+        ]
+        if column_name in _df.columns
+    ]
+
+    monthly_agg_kwargs = {
+        'electrolyser_consumption_mwh': ('electrolyser_consumption_mwh', 'sum'),
+        'ghg_compliant_intervals': ('is_emission_compliant', 'sum'),
+        'rfnbo_100pct_intervals': ('is_rfnbo_100pct', 'sum'),
+        'total_intervals': ('electrolyser_consumption_mwh', 'count'),
+    }
+
+    for column_name in ppa_energy_columns:
+        monthly_agg_kwargs[column_name] = (column_name, 'sum')
+
     if temporal_correlation == 'hourly':
         # Time-weighted average per month:
         #   value_month = Σ(value_h × Δt_h) / Σ(Δt_h)
@@ -515,10 +535,7 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
             _ef_weight_sum=('_ef_weighted',    'sum'),
             _rfnbo_weight_sum=('_rfnbo_weighted', 'sum'),
             _time_sum=('resolution_minutes',   'sum'),
-            electrolyser_consumption_mwh=('electrolyser_consumption_mwh', 'sum'),
-            ghg_compliant_intervals=('is_emission_compliant', 'sum'),
-            rfnbo_100pct_intervals=('is_rfnbo_100pct', 'sum'),
-            total_intervals=('electrolyser_consumption_mwh', 'count'),
+            **monthly_agg_kwargs,
         ).reset_index()
 
         monthly_metrics['emission_factor_mj'] = (
@@ -530,12 +547,9 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
 
     else:  # monthly correlation — sum-based (energy-weighted) formulas
         monthly_metrics = _df.groupby(['_year', '_month', '_month_abbr']).agg(
-            electrolyser_consumption_mwh=('electrolyser_consumption_mwh', 'sum'),
             total_emissions_g_co2eq=('total_emissions_g_co2eq', 'sum'),
             rfnbo_energy_mwh=('rfnbo_energy_mwh', 'sum'),
-            ghg_compliant_intervals=('is_emission_compliant', 'sum'),
-            rfnbo_100pct_intervals=('is_rfnbo_100pct', 'sum'),
-            total_intervals=('electrolyser_consumption_mwh', 'count'),
+            **monthly_agg_kwargs,
         ).reset_index()
 
         # EF_H2 = Σ(E_NRES × EF_grid × 1000) / (Σ(E_H2) × 1000)
@@ -556,7 +570,48 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
         )
 
     monthly_metrics = monthly_metrics.sort_values(['_year', '_month']).reset_index(drop=True)
+    # I don't think we need this in the code 
     monthly_metrics['year_str'] = monthly_metrics['_year'].astype(str)
+
+    display_columns = ['_year', '_month_abbr', 'emission_factor_mj', 'rfnbo_pct']
+    display_rename_map = {
+        '_year': 'Year',
+        '_month_abbr': 'Month',
+        'emission_factor_mj': 'EF (g CO₂eq/MJ)',
+        'rfnbo_pct': 'RFNBO %',
+    }
+
+    if 'ppa_energy_mwh' in monthly_metrics.columns:
+        display_columns.append('ppa_energy_mwh')
+        display_rename_map['ppa_energy_mwh'] = 'PPA Energy (MWh)'
+
+    if 'solar_energy_mwh' in monthly_metrics.columns:
+        display_columns.append('solar_energy_mwh')
+        display_rename_map['solar_energy_mwh'] = 'Solar Energy (MWh)'
+
+    if 'wind_onshore_energy_mwh' in monthly_metrics.columns:
+        display_columns.append('wind_onshore_energy_mwh')
+        display_rename_map['wind_onshore_energy_mwh'] = 'Wind Onshore Energy (MWh)'
+
+    if 'wind_offshore_energy_mwh' in monthly_metrics.columns:
+        display_columns.append('wind_offshore_energy_mwh')
+        display_rename_map['wind_offshore_energy_mwh'] = 'Wind Offshore Energy (MWh)'
+
+    period_rfnbo_pct = (
+    (monthly_metrics['rfnbo_pct'] * monthly_metrics['electrolyser_consumption_mwh']).sum()
+    / monthly_metrics['electrolyser_consumption_mwh'].sum()
+    if monthly_metrics['electrolyser_consumption_mwh'].sum() > 0 else 0.0)
+
+    st.dataframe(
+        monthly_metrics[display_columns].rename(columns=display_rename_map),
+        use_container_width=True,
+    )
+    #st.write(monthly_metrics)
+    #st.write(monthly_metrics.dtypes)
+
+    st.metric("Overall Period RFNBO %", f"{period_rfnbo_pct:.1f}%", help="Energy-weighted average RFNBO % over the entire period")
+
+
 
     multi_year = monthly_metrics['_year'].nunique() > 1
 
@@ -599,6 +654,11 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
                 delta_color="normal" if weighted_rfnbo >= 1.0 else "inverse",
                 help="Σ(E_RFNBO) / Σ(E_H2) across all hourly intervals"
             )
+    ##################################################################################
+    # I don't see why this would be monthly correlated, it uses de results_df which is hourly. 
+    # See in upstram code that calculate results_df that it already set some rfnbo_energy_mwh to zero for non-compliant intervals.
+    # So I think it is calculated wrongly in monthly correlation as there is no ghg check
+    ##################################################################################
     else:  # monthly correlation
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -690,6 +750,10 @@ def create_visualizations(results_df: pd.DataFrame, monthly_summary: pd.DataFram
             margin=dict(t=30)
         )
         st.plotly_chart(fig_rfnbo, use_container_width=True)
+
+    ##########################################################################################################################################
+    # This is not monthly statistics as the monhtly_summary is just the period of the dataframe that is being looked at/selected in the UI
+    ##########################################################################################################################################
     
     # 4. Monthly Summary Statistics
     if not monthly_summary.empty:
@@ -2026,6 +2090,10 @@ def main():
             # Display results
             st.header("📊 RFNBO Trends & Compliance")
             
+            #######################################################################################################################
+            # For me this is_rfnbo_compliant function is misleading as it only checks if the total period is 100 rfnbo compliant
+            #######################################################################################################################
+
             # Get compliance status
             compliance = is_rfnbo_compliant(monthly_summary)
             
